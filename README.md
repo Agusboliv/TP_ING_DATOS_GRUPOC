@@ -1,0 +1,1 @@
+kaggle : https://www.kaggle.com/datasets/mustafakeser4/looker-ecommerce-bigquery-dataset?select=products.csv
