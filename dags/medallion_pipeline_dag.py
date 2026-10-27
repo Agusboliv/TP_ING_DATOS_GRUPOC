@@ -7,7 +7,6 @@ import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import duckdb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -185,6 +184,8 @@ def medallion_pipeline_dag():
 
         Post: CATALOG_PATH con la vista actualizada.
         """
+        import duckdb  # import local: no corre en cada parseo del DAG
+
         pass
 
     @task
@@ -193,6 +194,8 @@ def medallion_pipeline_dag():
 
         Post: reporte en DATA_DIR con archivos y filas leídas por cada query.
         """
+        import duckdb  # import local: no corre en cada parseo del DAG
+
         pass
 
     # ── Dependencias ──────────────────────────────────────────────────────────
