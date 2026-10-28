@@ -7,6 +7,7 @@ import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -51,14 +52,42 @@ def medallion_pipeline_dag():
     # ── Bronze ────────────────────────────────────────────────────────────────
 
     @task
-    def extract(table: str, logical_date: datetime | None = None) -> None:
+    def extract(table: str, logical_date: datetime | None = None, dag_run=None) -> str:
         """Copia el CSV crudo de `table` a bronze, sin modificarlo.
 
         Pre:  SOURCE_DIR/SOURCE_FILES[table] existe.
-        Post: BRONZE_DIR/{table}/ingested_year=YYYY/ingested_month=MM/ contiene solo ese CSV.
+        Post: BRONZE_DIR/{table}/ingested_year=YYYY/ingested_month=MM/ contiene solo ese CSV,
+              byte a byte igual al original. Devuelve su ruta (XCom liviano, nunca datos).
         Inv:  la carpeta destino se borra antes de copiar (overwrite, nunca append).
+              La fecha de ingesta sale de la corrida, no del reloj: re-correr la misma
+              fecha pisa la misma carpeta.
         """
-        pass
+        # logical_date es None si la corrida se disparó por API sin fecha → run_after
+        ingestion_date = logical_date or dag_run.run_after
+
+        src = SOURCE_DIR / SOURCE_FILES[table]
+        if not src.is_file():
+            raise FileNotFoundError(f"No existe el archivo fuente de '{table}': {src}")
+
+        dest_dir = (
+            BRONZE_DIR
+            / table
+            / f"ingested_year={ingestion_date:%Y}"
+            / f"ingested_month={ingestion_date:%m}"
+        )
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir)
+        dest_dir.mkdir(parents=True)
+
+        dest = dest_dir / src.name
+        shutil.copy2(src, dest)
+
+        src_bytes, dest_bytes = src.stat().st_size, dest.stat().st_size
+        if dest_bytes != src_bytes:
+            raise OSError(f"Copia incompleta de '{table}': {dest_bytes} de {src_bytes} bytes")
+
+        print(f"[extract] {table}: {src} → {dest} ({dest_bytes / 1e6:.1f} MB)")
+        return str(dest)
 
     @task
     def validate_bronze() -> None:
@@ -184,8 +213,6 @@ def medallion_pipeline_dag():
 
         Post: CATALOG_PATH con la vista actualizada.
         """
-        import duckdb  # import local: no corre en cada parseo del DAG
-
         pass
 
     @task
@@ -194,8 +221,6 @@ def medallion_pipeline_dag():
 
         Post: reporte en DATA_DIR con archivos y filas leídas por cada query.
         """
-        import duckdb  # import local: no corre en cada parseo del DAG
-
         pass
 
     # ── Dependencias ──────────────────────────────────────────────────────────
