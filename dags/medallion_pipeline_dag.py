@@ -52,23 +52,81 @@ def medallion_pipeline_dag():
     # ── Bronze ────────────────────────────────────────────────────────────────
 
     @task
-    def extract(table: str, logical_date: datetime | None = None) -> None:
+    def extract(table: str, logical_date: datetime | None = None, dag_run=None) -> str:
         """Copia el CSV crudo de `table` a bronze, sin modificarlo.
 
         Pre:  SOURCE_DIR/SOURCE_FILES[table] existe.
-        Post: BRONZE_DIR/{table}/ingested_year=YYYY/ingested_month=MM/ contiene solo ese CSV.
+        Post: BRONZE_DIR/{table}/ingested_year=YYYY/ingested_month=MM/ contiene solo ese CSV,
+              byte a byte igual al original. Devuelve su ruta (XCom liviano, nunca datos).
         Inv:  la carpeta destino se borra antes de copiar (overwrite, nunca append).
+              La fecha de ingesta sale de la corrida, no del reloj: re-correr la misma
+              fecha pisa la misma carpeta.
         """
-        pass
+        # logical_date es None si la corrida se disparó por API sin fecha → run_after
+        ingestion_date = logical_date or dag_run.run_after
 
-    @task
-    def validate_bronze() -> None:
+        src = SOURCE_DIR / SOURCE_FILES[table]
+        if not src.is_file():
+            raise FileNotFoundError(f"No existe el archivo fuente de '{table}': {src}")
+
+        dest_dir = (
+            BRONZE_DIR
+            / table
+            / f"ingested_year={ingestion_date:%Y}"
+            / f"ingested_month={ingestion_date:%m}"
+        )
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir)
+        dest_dir.mkdir(parents=True)
+
+        dest = dest_dir / src.name
+        shutil.copy2(src, dest)
+        # no usamos pandas porque reescribe el archivo 
+        # y cambia el tamaño de bytes (aunque los datos sean iguales)
+
+        src_bytes, dest_bytes = src.stat().st_size, dest.stat().st_size
+        if dest_bytes != src_bytes:
+            raise OSError(f"Copia incompleta de '{table}': {dest_bytes} de {src_bytes} bytes")
+
+        print(f"[extract] {table}: {src} → {dest} ({dest_bytes / 1e6:.1f} MB)")
+        return str(dest)
+
+    @task(retries=0)  # si los datos están mal, reintentar no los arregla
+    def validate_bronze(paths: list[str]) -> None:
         """Compuerta antes de silver: las 7 tablas aterrizaron bien.
 
-        Pre:  corrieron todas las instancias de extract.
-        Post: falla el DAG si falta un archivo, está vacío o le faltan columnas esperadas.
+        Pre:  corrieron todas las instancias de extract; `paths` son sus rutas (vía XCom).
+        Post: falla el DAG si falta una tabla, si un archivo no existe, está vacío
+              o no tiene al menos encabezado + una fila de datos.
         """
-        pass
+        paths = [Path(p) for p in paths]
+        errors = []
+
+        # bronze/{table}/ingested_year=YYYY/ingested_month=MM/{archivo} → parents[2] es {table}
+        missing = set(SOURCE_FILES) - {p.parents[2].name for p in paths}
+        if missing:
+            errors.append(f"faltan tablas: {sorted(missing)}")
+
+        for path in paths:
+            if not path.is_file():
+                errors.append(f"no existe: {path}")
+                continue
+
+            # Solo las 2 primeras líneas: no hace falta leer los 394 MB de events
+            with path.open(encoding="utf-8") as f:
+                header, first_row = f.readline(), f.readline()
+
+            if not header.strip():
+                errors.append(f"vacío: {path}")
+            elif not first_row.strip():
+                errors.append(f"sin filas de datos: {path}")
+            else:
+                print(f"[validate_bronze] OK {path.parents[2].name}: "
+                      f"{path.stat().st_size / 1e6:.1f} MB | {header.strip()}")
+
+        # Se juntan todos los errores y se falla una sola vez, mostrando todo lo que está mal
+        if errors:
+            raise ValueError("Bronze inválido:\n  - " + "\n  - ".join(errors))
 
     # ── Silver ────────────────────────────────────────────────────────────────
 
@@ -197,9 +255,11 @@ def medallion_pipeline_dag():
 
     # ── Dependencias ──────────────────────────────────────────────────────────
 
+    # Pasar la salida de extract como argumento ya crea la dependencia extract >> validate_bronze
+    bronze_paths = extract.expand(table=list(SOURCE_FILES))
+
     (
-        extract.expand(table=list(SOURCE_FILES))
-        >> validate_bronze()
+        validate_bronze(bronze_paths)
         >> silver()
         >> validate_silver()
         >> build_gold()
