@@ -73,8 +73,13 @@ def write_staging(df: pd.DataFrame, table: str) -> Path:
 
 @dag(
     dag_id="medallion_pipeline_dag",
-    schedule="@daily",
-    start_date=datetime(2025, 1, 1),
+    # @monthly porque la partición de gold es mensual: con @daily, las 30 corridas
+    # de un mes reescriben la misma carpeta. start_date/end_date acotan el DAG al
+    # rango real del dataset (2019-01 a 2024-01), así ninguna fecha lógica cae
+    # fuera de los datos y genera particiones vacías.
+    schedule="@monthly",
+    start_date=datetime(2019, 1, 1),
+    end_date=datetime(2024, 2, 1),
     catchup=False,
     tags=["TP_ING"],
     default_args={"retries": 2, "retry_delay": timedelta(seconds=15)},
@@ -644,14 +649,140 @@ def medallion_pipeline_dag():
     # ── Gold ──────────────────────────────────────────────────────────────────
 
     @task(outlets=[GOLD_ASSET])
-    def build_gold(logical_date: datetime | None = None) -> None:
+    def build_gold(logical_date: datetime | None = None, dag_run=None) -> str:
         """Join order_items + orders + products + users (hasheado) + distribution_centers.
 
         Pre:  silver validado; ventana = mes calendario de logical_date sobre orders.created_at.
         Post: GOLD_DIR/{GOLD_DATASET}/year=YYYY/month=MM/ solo con ítems de órdenes de ese mes.
         Inv:  se sobreescribe únicamente esa partición; grano = un ítem de orden.
         """
-        pass
+        # Ventana = mes calendario de la fecha lógica. Derivarla así (y no de
+        # data_interval_end) hace que un trigger manual, un backfill y una corrida
+        # programada procesen exactamente el mismo rango.
+        run_date = pd.Timestamp(logical_date or dag_run.run_after)
+        run_date = run_date.tz_localize("UTC") if run_date.tzinfo is None else run_date.tz_convert("UTC")
+        window_start = run_date.normalize().replace(day=1)
+        window_end = window_start + pd.offsets.MonthBegin(1)
+
+        orders = pd.read_parquet(SILVER_DIR / "orders" / "orders.parquet")
+        month_orders = orders[
+            (orders["created_at"] >= window_start) & (orders["created_at"] < window_end)
+        ]
+
+        if month_orders.empty:
+            print(f"[build_gold] ATENCIÓN: 0 órdenes en {window_start:%Y-%m}. "
+                  f"El dataset va de 2019-01 a 2024-01: si la fecha lógica cae fuera "
+                  f"de ese rango la partición queda vacía.")
+
+        # El ítem pertenece al mes de SU ORDEN, no al de su propio created_at
+        # (que puede caer días después). Por eso se filtra por order_id y no por fecha.
+        items = pd.read_parquet(SILVER_DIR / "order_items" / "order_items.parquet")
+        items = items[items["order_id"].isin(set(month_orders["order_id"]))]
+
+        users = pd.read_parquet(SILVER_DIR / "users" / "users.parquet")
+        products = pd.read_parquet(SILVER_DIR / "products" / "products.parquet")
+        centers = pd.read_parquet(SILVER_DIR / "distribution_centers" / "distribution_centers.parquet")
+
+        # INNER contra orders: un ítem sin pedido no es una venta.
+        # LEFT contra las dimensiones: un dato de catálogo o de logística faltante
+        # no puede hacer desaparecer una venta real. Hoy validate_silver reporta
+        # 0 huérfanos, así que ambas dan lo mismo; la diferencia protege a futuro.
+        gold = (
+            items.rename(columns={
+                "id": "order_item_id",
+                "status": "item_status",
+                "shipped_at": "item_shipped_at",
+                "delivered_at": "item_delivered_at",
+                "returned_at": "item_returned_at",
+            })
+            .drop(columns=["created_at"])  # se usa la fecha de la orden, no la del ítem
+            .merge(
+                month_orders[["order_id", "status", "created_at", "num_of_item"]].rename(
+                    columns={
+                        "status": "order_status",
+                        "created_at": "ordered_at",
+                        "num_of_item": "items_in_order",
+                    }
+                ),
+                on="order_id",
+                how="inner",
+            )
+            .merge(
+                users[["id", "email_hash", "age", "gender", "state", "city",
+                       "country", "traffic_source"]].rename(columns={
+                    "id": "user_id",
+                    "email_hash": "user_email_hash",
+                    "age": "user_age",
+                    "gender": "user_gender",
+                    "state": "user_state",
+                    "city": "user_city",
+                    "country": "user_country",
+                    "traffic_source": "user_traffic_source",
+                }),
+                on="user_id",
+                how="left",
+            )
+            .merge(
+                products[["id", "name", "category", "brand", "department",
+                          "cost", "retail_price", "distribution_center_id"]].rename(columns={
+                    "id": "product_id",
+                    "name": "product_name",
+                    "category": "product_category",
+                    "brand": "product_brand",
+                    "department": "product_department",
+                    "cost": "product_cost",
+                    "retail_price": "product_retail_price",
+                }),
+                on="product_id",
+                how="left",
+            )
+            .merge(
+                centers[["id", "name"]].rename(columns={
+                    "id": "distribution_center_id",
+                    "name": "distribution_center",
+                }),
+                on="distribution_center_id",
+                how="left",
+            )
+        )
+
+        # Métricas derivadas: lo que el analista no debería tener que calcular.
+        gold["margin"] = gold["sale_price"] - gold["product_cost"]
+        gold["is_returned"] = gold["item_returned_at"].notna()
+        gold["delivery_days"] = (
+            gold["item_delivered_at"] - gold["ordered_at"]
+        ).dt.total_seconds() / 86400
+
+        columns = [
+            "order_item_id", "order_id", "user_id", "product_id", "inventory_item_id",
+            "ordered_at", "item_shipped_at", "item_delivered_at", "item_returned_at",
+            "order_status", "item_status", "is_returned", "items_in_order", "delivery_days",
+            "sale_price", "product_cost", "product_retail_price", "margin",
+            "product_name", "product_category", "product_brand", "product_department",
+            "distribution_center",
+            "user_email_hash", "user_age", "user_gender",
+            "user_state", "user_city", "user_country", "user_traffic_source",
+        ]
+        gold = gold[columns]
+
+        # Red de seguridad: nada fuera de la ventana puede entrar a esta partición.
+        outside = int((
+            (gold["ordered_at"] < window_start) | (gold["ordered_at"] >= window_end)
+        ).sum())
+        if outside:
+            raise ValueError(f"{outside} filas fuera de la ventana {window_start:%Y-%m}")
+
+        # year y month NO van adentro del Parquet: viven en la ruta y DuckDB los
+        # infiere con hive_partitioning. Escribirlos además sería duplicarlos.
+        out_dir = GOLD_DIR / GOLD_DATASET / f"year={window_start:%Y}" / f"month={window_start:%m}"
+        out = _write_parquet_dir(gold, out_dir, GOLD_DATASET)
+
+        print(f"[build_gold] {window_start:%Y-%m}: {len(month_orders)} órdenes → {len(gold)} ítems "
+              f"| {len(columns)} columnas | {out}")
+        print(f"[build_gold] ingresos {gold['sale_price'].sum():,.2f} "
+              f"| margen {gold['margin'].sum():,.2f} "
+              f"| devueltos {int(gold['is_returned'].sum())}")
+        return str(out)
 
     @task
     def validate_gold(logical_date: datetime | None = None) -> None:

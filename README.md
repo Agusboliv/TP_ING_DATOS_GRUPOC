@@ -183,6 +183,64 @@ products.distribution_center_id → distribution_centers.id
 
 **Costo.** La tarea lee únicamente las columnas de claves, no las tablas completas: validar la integridad de `inventory_items` no requiere cargar sus 490.705 registros con los doce campos.
 
+## Capa Gold (`build_gold`)
+
+Modelo analítico denormalizado. **Grano: un registro por ítem vendido.**
+
+### Join de cinco entidades de silver
+
+```
+order_items                                   (grano)
+   ├── orders               order_id          INNER
+   ├── users                user_id           LEFT
+   ├── products             product_id        LEFT
+   └── distribution_centers  vía products.distribution_center_id   LEFT
+```
+
+**Por qué `INNER` contra `orders` y `LEFT` contra las dimensiones.** Un ítem sin pedido no es una venta: no tiene fecha, ni estado, ni cliente, y no debería existir en gold. En cambio, un producto sin nombre cargado o un centro de distribución faltante no pueden hacer desaparecer una venta real. `validate_silver` reporta hoy 0 huérfanos en las cinco relaciones, así que ambas decisiones dan el mismo resultado; la diferencia protege de cargas futuras.
+
+**`inventory_items` queda fuera del join.** Se verificó que `inventory_items.cost` coincide con `products.cost` en **las 181.759 filas** (0 diferencias), así que el costo unitario sale de `products` sin perder precisión y el modelo se simplifica en una tabla.
+
+### Particionado
+
+```
+data/gold/order_items_enriched/year=YYYY/month=MM/order_items_enriched.parquet
+```
+
+**La fecha de negocio es `orders.created_at`**, la fecha en que se hizo el pedido. Se eligió sobre las alternativas:
+
+- `delivered_at`: nula en el 65% de los casos, dejaría la mayoría de las ventas sin partición.
+- `order_items.created_at`: no coincide con la de su pedido (la fila del ítem se escribe días después), así que partiría pedidos entre dos meses.
+- Dimensiones como categoría o centro: no son temporales, no sirven para backfills ni para consultas por período.
+
+**`year` y `month` no se escriben dentro del Parquet.** Viven solo en el nombre de la carpeta y DuckDB los reconstruye como columnas con `hive_partitioning=true`. Escribirlos además sería duplicar el dato en cada fila.
+
+**El ítem se asigna al mes de su orden, no al suyo propio:** el filtro es por `order_id` contra las órdenes del mes, no por `order_items.created_at`.
+
+### Idempotencia
+
+Antes de escribir, la tarea borra **esa** carpeta de partición y la vuelve a crear. Nunca hace append, y nunca toca los otros meses. Correr dos veces el mismo mes deja exactamente el mismo contenido. Además, un control verifica que ninguna fila quede fuera de la ventana antes de escribir.
+
+### Columnas
+
+30 columnas: claves, fechas del ciclo de vida, estados, importes (`sale_price`, `product_cost`, `product_retail_price`), atributos de producto y de logística, y datos del cliente ya anonimizados (`user_email_hash`, edad, género, ubicación, canal).
+
+Tres métricas derivadas que el analista no debería tener que calcular: `margin` (`sale_price - product_cost`), `is_returned` y `delivery_days`.
+
+### Resultado medido (mayo 2023)
+
+```
+4093 órdenes → 5948 ítems | 0 filas fuera de la ventana
+ingresos 347.730,12 | margen 180.249,28 | devueltos 630
+días de entrega promedio: 4.0
+```
+
+Un `product_name` quedó nulo: es uno de los dos productos sin nombre que `clean_products` decidió conservar. El `LEFT JOIN` hizo su trabajo — la venta está en gold aunque al producto le falte el nombre comercial.
+
+### Una corrida llena una sola partición
+
+Cada ejecución escribe **un mes**. Para tener las 61 particiones del dataset (2019-01 a 2024-01) hay que hacer un **backfill** de ese rango. Si la fecha lógica cae fuera —por ejemplo una corrida manual de hoy— no hay órdenes que procesar y la partición queda vacía; la tarea lo avisa en el log en vez de fallar en silencio.
+
 ### events: fuera del alcance
 
 `events.csv` (2.431.963 filas, 376 MB) registra la navegación de los usuarios por el sitio: clics, vistas de producto y carritos. No alimenta el modelo de gold, que se construye sobre ventas concretas. Se excluye del pipeline de silver, lo que además deja el dataset en 139 MB, dentro del límite de 50–300 MB de la consigna.
