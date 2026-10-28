@@ -69,6 +69,88 @@ Además, las fechas respetan el orden del proceso: ningún envío es anterior a 
 - **Validación de rango:** la tarea falla si aparece algún `sale_price` nulo o negativo. Una venta con importe negativo no es un dato sucio recuperable: es un error de origen que invalidaría las sumas de gold. Hoy hay 0 casos.
 - **Normalización:** `status` se lleva a formato título quitando espacios, igual que en `orders`.
 
-### Pendientes
+### inventory_items (`clean_inventory_items`)
 
-`inventory_items`, `products`, `distribution_centers`, `events`, `users`: se documentan al implementar su tarea `clean_*`.
+490.705 filas, una por unidad física de stock.
+
+| Columna | Nulos | Decisión | Justificación de negocio |
+|---|---|---|---|
+| `sold_at` | 308.946 (63,0%) | Se conservan como `NULL` | La unidad **todavía no se vendió**: sigue en stock. Es el estado normal de un inventario, no un dato faltante. Imputar una fecha la daría por vendida e inflaría cualquier métrica de rotación. |
+| `product_name` | 29 (0,006%) | Se conservan | Heredados de `products` (ver más abajo). |
+| `product_brand` | 401 (0,08%) | Se conservan | Ídem. |
+
+**Columnas obligatorias.** Se descartan las filas sin `id`, `product_id`, `created_at`, `cost` o `product_distribution_center_id`: sin ellas no se sabe qué unidad es, cuándo entró al stock, cuánto costó ni de qué centro salió. `sold_at` queda afuera a propósito. Hoy se descartan 0 filas.
+
+**Atributos de producto duplicados.** La tabla trae seis columnas `product_*` que repiten datos de `products`. Se verificó sobre las 490.705 filas que **coinciden al 100%** con la tabla de origen (0 diferencias en precio y categoría, 0 `product_id` huérfanos), así que se conservan y se normalizan con el mismo criterio. La fuente de verdad para gold sigue siendo `products`.
+
+**Controles.** `cost` negativo hace **fallar** la tarea. Las unidades con `sold_at` anterior a `created_at` (vendidas antes de existir) se cuentan y se loguean sin eliminarlas: hoy son 0.
+
+### products (`clean_products`)
+
+29.120 filas, el catálogo.
+
+| Columna | Nulos | Decisión | Justificación de negocio |
+|---|---|---|---|
+| `name` | 2 (0,007%) | Se conservan como `NULL` | Un producto sin nombre comercial cargado **igual se vende**: tiene categoría, precio y SKU. Descartarlo perdería las ventas asociadas en gold. |
+| `brand` | 24 (0,08%) | Se conservan como `NULL` | Ídem: no todos los productos son de marca. `NULL` significa "sin marca declarada", que es distinto de inventar un `"Sin marca"` que se confundiría con una marca real. |
+
+**Columnas obligatorias.** Se descartan las filas sin `id`, `cost`, `retail_price`, `category`, `department` o `distribution_center_id`. Sin precio y costo no hay margen que calcular en gold; sin categoría ni departamento el producto no entra en ningún agrupamiento; sin centro de distribución se pierde la trazabilidad logística. Hoy se descartan 0 filas.
+
+**Controles.** Un `cost` o `retail_price` negativo hace **fallar** la tarea. Los productos con precio de venta por debajo del costo se cuentan y se loguean sin eliminarlos: no son un error de datos (puede ser liquidación) pero explican márgenes negativos en gold. Hoy son 0.
+
+**Normalización.** `category`, `department` y `brand` a formato título; `sku` a mayúsculas por ser identificador; `name` solo sin espacios sobrantes.
+
+### distribution_centers (`clean_distribution_centers`)
+
+10 filas, la dimensión más chica. **Sin nulos en ninguna columna.**
+
+**Columnas obligatorias.** Las cuatro (`id`, `name`, `latitude`, `longitude`): en una tabla de 10 filas cada una se usa entera, el id para unir y las coordenadas para cualquier análisis geográfico.
+
+**Control de rango.** Si aparece una latitud fuera de ±90 o una longitud fuera de ±180, la tarea **falla**. En una dimensión de 10 filas una coordenada imposible es un error de carga, no un outlier estadístico.
+
+**Normalización.** A `name` solo se le quitan espacios, **no** se le aplica formato título: los nombres llevan la sigla del estado (`"Memphis TN"`) y pasarlos a título la rompería (`"Memphis Tn"`).
+
+### users (`clean_users`)
+
+100.000 filas. Es la única tabla con **PII**, así que su tarea no escribe en silver: deja el resultado en `staging/`, y `mask_pii` es la que anonimiza y publica en silver.
+
+| Columna | Nulos | Decisión | Justificación de negocio |
+|---|---|---|---|
+| `city` | 958 (1,0%) | Se conservan como `NULL` | Un domicilio incompleto no invalida al cliente ni a sus compras. El usuario sigue teniendo `state` y `country` para los análisis geográficos agregados. |
+
+**Columnas obligatorias.** Se descartan las filas sin `id`, `email` o `created_at`. El `email` es obligatorio porque es lo que `mask_pii` convierte en `email_hash`, la clave con la que un analista agrupa clientes en gold: sin él, el usuario no se puede unir a nada. Hoy se descartan 0 filas.
+
+**No se deduplica por email.** 15.989 usuarios (16%) comparten dirección de correo con otro usuario. Deduplicar por email fusionaría clientes distintos y perdería sus compras. La identidad de negocio es `id`; el hash del email es un atributo, no una clave. **Consecuencia a tener presente:** `email_hash` no identifica unívocamente a un cliente en gold.
+
+**Normalización del email antes del hash.** El email se lleva a minúsculas y sin espacios **en esta tarea**, no en `mask_pii`. El hash se calcula sobre el texto final, así que `"Juan@Mail.com"` y `"juan@mail.com"` tienen que llegar idénticos o producirían dos hashes distintos para la misma dirección.
+
+**Normalización del resto.** `gender` a mayúsculas; `state`, `city`, `country` y `traffic_source` a formato título. A `first_name`, `last_name` y `street_address` solo se les quitan espacios: son PII que `mask_pii` va a descartar, y aplicarles formato título alteraría apellidos legítimos.
+
+## Gobernanza de PII (`mask_pii`)
+
+`users` es la única tabla con datos personales, y por eso su limpieza está partida en dos tareas: `clean_users` escribe en `staging/` (fuera de silver) y `mask_pii` es la única que publica en `silver/users/`. El email en claro nunca se escribe en la capa que consultan los analistas.
+
+De las 15 columnas originales quedan 9:
+
+| Columna | Tratamiento | Por qué |
+|---|---|---|
+| `email` | **Hash** SHA-256 + salt → `email_hash` | Es la clave con la que un analista agrupa clientes. Hay que poder unir por ella sin exponer la dirección. |
+| `first_name`, `last_name` | **Se borran** | Nadie agrupa ventas por nombre. Hashearlos tampoco serviría: hay pocos miles de nombres posibles y la tabla de hashes se arma en minutos. |
+| `street_address` | **Se borra** | Identifica un domicilio y no entra en ningún agregado. |
+| `postal_code` | **Se borra** | **2.515 usuarios son los únicos con su código postal**: para ellos el código *es* un identificador. |
+| `latitude`, `longitude` | **Se borran** | 16.404 pares distintos para 100.000 usuarios. Conservarlos mientras se borra la dirección sería contradictorio: son dos formas de decir lo mismo. |
+| `id`, `age`, `gender`, `state`, `city`, `country`, `traffic_source`, `created_at` | **Se conservan** | Atributos demográficos agregables: sirven para analizar y no apuntan a una persona concreta. `city`, `state` y `country` alcanzan para cualquier análisis geográfico. |
+
+**Por qué hash y no borrado, solo para el email.** El hash tiene una única utilidad: conservar la capacidad de unir o agrupar sin exponer el valor. Si no se necesita unir por esa columna, el hash no aporta nada y el borrado protege más. El email es la excepción porque *es* el identificador de cliente.
+
+**Por qué el salt.** Sin salt, un SHA-256 de un email se revierte por diccionario: el espacio de direcciones plausibles es chico y precalcular sus hashes es barato. Con un salt secreto que no vive junto a los datos, esa tabla precalculada no sirve. El salt se guarda como **Airflow Variable** `PII_SALT`, nunca en un archivo del repo, y se lee **dentro de la tarea** (`Variable.get` a nivel módulo se ejecutaría en cada parseo del DAG, cada ~30 segundos, golpeando la metadata DB sin motivo). Si la Variable no está, la tarea falla con un mensaje explicando cómo cargarla: no hay hash sin salt.
+
+**Verificación.** Sobre las 100.000 filas: 0 emails nulos, hashes de 64 caracteres, y **84.011 hashes distintos**. La diferencia con las 100.000 filas son exactamente los 15.989 usuarios que comparten email: mismo email → mismo hash, que es la propiedad que hace el hash joinable. El único nulo que sobrevive en silver es `city` (958).
+
+**Control de fugas.** Después del borrado, la tarea verifica que ninguna columna de PII quedó en el DataFrame antes de escribir, y recién ahí borra `staging/users/`. Si mañana el origen agrega una columna sensible y alguien olvida sumarla a la lista, el chequeo la detecta.
+
+**Limitación a tener presente.** Como 15.989 usuarios comparten email, `email_hash` **no identifica unívocamente a un cliente**: agrupar por hash puede juntar dos usuarios distintos. La identidad de negocio sigue siendo `id`.
+
+### events: fuera del alcance
+
+`events.csv` (2.431.963 filas, 376 MB) registra la navegación de los usuarios por el sitio: clics, vistas de producto y carritos. No alimenta el modelo de gold, que se construye sobre ventas concretas. Se excluye del pipeline de silver, lo que además deja el dataset en 139 MB, dentro del límite de 50–300 MB de la consigna.

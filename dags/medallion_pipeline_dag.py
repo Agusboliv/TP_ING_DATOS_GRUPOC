@@ -50,9 +50,8 @@ def bronze_dir(table: str, ingestion_date: datetime) -> Path:
     )
 
 
-def write_silver(df: pd.DataFrame, table: str) -> Path:
-    """Sobrescribe SILVER_DIR/{table}/ con un único Parquet (overwrite, nunca append)."""
-    out_dir = SILVER_DIR / table
+def _write_parquet_dir(df: pd.DataFrame, out_dir: Path, table: str) -> Path:
+    """Sobrescribe out_dir con un único Parquet (overwrite, nunca append)."""
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
@@ -60,6 +59,16 @@ def write_silver(df: pd.DataFrame, table: str) -> Path:
     out = out_dir / f"{table}.parquet"
     df.to_parquet(out, index=False)
     return out
+
+
+def write_silver(df: pd.DataFrame, table: str) -> Path:
+    """Sobrescribe SILVER_DIR/{table}/ con un único Parquet (overwrite, nunca append)."""
+    return _write_parquet_dir(df, SILVER_DIR / table, table)
+
+
+def write_staging(df: pd.DataFrame, table: str) -> Path:
+    """Igual que write_silver pero en STAGING_DIR: datos con PII que no pueden llegar a silver."""
+    return _write_parquet_dir(df, STAGING_DIR / table, table)
 
 
 @dag(
@@ -297,54 +306,265 @@ def medallion_pipeline_dag():
         return str(out)
 
     @task
-    def clean_inventory_items() -> None:
+    def clean_inventory_items(logical_date: datetime | None = None, dag_run=None) -> str:
         """Tipado de cost y product_retail_price; sold_at nulo = ítem aún en stock; dedup por id.
 
-        Post: SILVER_DIR/inventory_items/ en Parquet; id único.
+        Pre:  bronze/inventory_items de la fecha de ingesta de esta corrida existe.
+        Post: SILVER_DIR/inventory_items/inventory_items.parquet; id único.
+        Inv:  sold_at nulo se conserva: es stock todavía no vendido, no un dato faltante.
         """
-        pass
+        src = bronze_dir("inventory_items", logical_date or dag_run.run_after) / SOURCE_FILES["inventory_items"]
+
+        df = pd.read_csv(src, dtype=str)
+        rows_in = len(df)
+
+        # Nulos que invalidan la unidad de inventario: sin id no hay PK, sin
+        # product_id no se sabe qué unidad es, sin created_at no se sabe cuándo
+        # entró al stock y sin cost no se puede calcular margen en gold.
+        # sold_at NO entra: su ausencia es justamente la señal de "sin vender".
+        required = ["id", "product_id", "created_at", "cost", "product_distribution_center_id"]
+        df = df.dropna(subset=required)
+        rows_null = rows_in - len(df)
+
+        df = df.drop_duplicates(subset="id")
+
+        for col in ["id", "product_id", "product_distribution_center_id"]:
+            df[col] = df[col].astype("int64")
+
+        df["cost"] = df["cost"].astype("float64")
+        df["product_retail_price"] = df["product_retail_price"].astype("float64")
+        if (df["cost"] < 0).any():
+            raise ValueError(f"{int((df['cost'] < 0).sum())} unidades con cost negativo")
+
+        for col in ["created_at", "sold_at"]:
+            df[col] = pd.to_datetime(df[col], format="ISO8601", utc=True).dt.as_unit("us")
+
+        # Una unidad no se puede vender antes de entrar al stock. Se cuenta y se
+        # loguea sin eliminar: es una anomalía a investigar, no una fila inútil.
+        impossible = (df["sold_at"].notna() & (df["sold_at"] < df["created_at"])).sum()
+
+        # Atributos del producto copiados en esta tabla (ver README: coinciden al
+        # 100% con products). Se normalizan igual para que silver sea consistente.
+        df["product_category"] = df["product_category"].str.strip().str.title()
+        df["product_department"] = df["product_department"].str.strip().str.title()
+        df["product_brand"] = df["product_brand"].str.strip().str.title()
+        df["product_name"] = df["product_name"].str.strip()
+        df["product_sku"] = df["product_sku"].str.strip().str.upper()
+
+        out = write_silver(df, "inventory_items")
+        print(f"[clean_inventory_items] {rows_in} filas leídas | {rows_null} con nulos en claves "
+              f"| {rows_in - rows_null - len(df)} duplicadas eliminadas "
+              f"| {impossible} vendidas antes de existir | {len(df)} escritas en {out}")
+        print(f"[clean_inventory_items] sin vender (sold_at nulo): {int(df['sold_at'].isna().sum())}")
+        return str(out)
 
     @task
-    def clean_products() -> None:
+    def clean_products(logical_date: datetime | None = None, dag_run=None) -> str:
         """Tipado de cost/retail_price; casing de category/department; regla para name/brand nulos.
 
-        Post: SILVER_DIR/products/ en Parquet; id único.
+        Pre:  bronze/products de la fecha de ingesta de esta corrida existe.
+        Post: SILVER_DIR/products/products.parquet; id único.
+        Inv:  name y brand nulos se conservan: un producto sin nombre comercial igual
+              se vende, tiene categoría y tiene precio.
         """
-        pass
+        src = bronze_dir("products", logical_date or dag_run.run_after) / SOURCE_FILES["products"]
+
+        df = pd.read_csv(src, dtype=str)
+        rows_in = len(df)
+
+        # Sin id no hay PK; sin cost ni retail_price no hay margen en gold; sin
+        # category/department el producto no se puede agrupar en ningún análisis;
+        # sin distribution_center_id se pierde la trazabilidad logística.
+        # name y brand quedan afuera a propósito (ver Inv).
+        required = ["id", "cost", "retail_price", "category", "department", "distribution_center_id"]
+        df = df.dropna(subset=required)
+        rows_null = rows_in - len(df)
+
+        df = df.drop_duplicates(subset="id")
+
+        df["id"] = df["id"].astype("int64")
+        df["distribution_center_id"] = df["distribution_center_id"].astype("int64")
+        df["cost"] = df["cost"].astype("float64")
+        df["retail_price"] = df["retail_price"].astype("float64")
+
+        invalid = (df["cost"] < 0) | (df["retail_price"] < 0)
+        if invalid.any():
+            raise ValueError(f"{int(invalid.sum())} productos con precio o costo negativo")
+
+        # Productos que se venden por debajo del costo: no es un error de datos,
+        # pero se loguea porque explica márgenes negativos en gold.
+        below_cost = int((df["retail_price"] < df["cost"]).sum())
+
+        df["category"] = df["category"].str.strip().str.title()
+        df["department"] = df["department"].str.strip().str.title()
+        df["brand"] = df["brand"].str.strip().str.title()
+        df["name"] = df["name"].str.strip()
+        df["sku"] = df["sku"].str.strip().str.upper()
+
+        out = write_silver(df, "products")
+        print(f"[clean_products] {rows_in} filas leídas | {rows_null} con nulos en claves "
+              f"| {rows_in - rows_null - len(df)} duplicadas eliminadas "
+              f"| {below_cost} con precio bajo el costo | {len(df)} escritas en {out}")
+        print(f"[clean_products] nulos conservados: name={int(df['name'].isna().sum())}, "
+              f"brand={int(df['brand'].isna().sum())}")
+        return str(out)
 
     @task
-    def clean_distribution_centers() -> None:
+    def clean_distribution_centers(logical_date: datetime | None = None, dag_run=None) -> str:
         """Tipado de latitude/longitude; dedup por id.
 
-        Post: SILVER_DIR/distribution_centers/ en Parquet; id único.
+        Pre:  bronze/distribution_centers de la fecha de ingesta de esta corrida existe.
+        Post: SILVER_DIR/distribution_centers/distribution_centers.parquet; id único.
+        Inv:  `name` solo se le quitan espacios: lleva la sigla del estado ("Memphis TN")
+              y pasarlo a formato título la rompería ("Memphis Tn").
         """
-        pass
+        src = bronze_dir("distribution_centers", logical_date or dag_run.run_after) / SOURCE_FILES["distribution_centers"]
+
+        df = pd.read_csv(src, dtype=str)
+        rows_in = len(df)
+
+        # Las cuatro columnas son obligatorias: es una dimensión de 10 filas donde
+        # cada una se usa entera (el id para unir, el nombre para mostrar y las
+        # coordenadas para cualquier análisis geográfico).
+        required = ["id", "name", "latitude", "longitude"]
+        df = df.dropna(subset=required)
+        rows_null = rows_in - len(df)
+
+        df = df.drop_duplicates(subset="id")
+
+        df["id"] = df["id"].astype("int64")
+        df["latitude"] = df["latitude"].astype("float64")
+        df["longitude"] = df["longitude"].astype("float64")
+        df["name"] = df["name"].str.strip()
+
+        # Coordenadas fuera de rango en una tabla de 10 filas es un error de carga,
+        # no un outlier: se corta la corrida.
+        out_of_range = (
+            df["latitude"].abs().gt(90) | df["longitude"].abs().gt(180)
+        )
+        if out_of_range.any():
+            raise ValueError(f"{int(out_of_range.sum())} centros con coordenadas fuera de rango")
+
+        out = write_silver(df, "distribution_centers")
+        print(f"[clean_distribution_centers] {rows_in} filas leídas | {rows_null} con nulos en claves "
+              f"| {rows_in - rows_null - len(df)} duplicadas eliminadas | {len(df)} escritas en {out}")
+        return str(out)
+
 
     @task
-    def clean_events() -> None:
-        """Tabla más grande. Tipado de created_at; user_id nulo = sesión anónima (se conserva).
-
-        Post: SILVER_DIR/events/ en Parquet; id único; sin ip_address (PII sin uso analítico).
-        """
-        pass
-
-    @task
-    def clean_users() -> None:
+    def clean_users(logical_date: datetime | None = None, dag_run=None) -> str:
         """Tipado de age/created_at; casing de city/state/country; dedup por id. Todavía con PII.
 
-        Post: STAGING_DIR/users/ en Parquet (fuera de silver).
+        Pre:  bronze/users de la fecha de ingesta de esta corrida existe.
+        Post: STAGING_DIR/users/users.parquet (fuera de silver, porque todavía tiene PII
+              en claro). Lo consume mask_pii, que es quien escribe en silver.
+        Inv:  no se deduplica por email: 15.989 usuarios comparten dirección con otro
+              (ver README). La identidad de negocio es `id`, no el mail.
         """
-        pass
+        src = bronze_dir("users", logical_date or dag_run.run_after) / SOURCE_FILES["users"]
+
+        df = pd.read_csv(src, dtype=str)
+        rows_in = len(df)
+
+        # Sin id no hay PK; sin email no hay hash con el que unir en gold; sin
+        # created_at no se sabe desde cuándo es cliente. city/state y las
+        # coordenadas quedan afuera: un domicilio incompleto no invalida al cliente.
+        required = ["id", "email", "created_at"]
+        df = df.dropna(subset=required)
+        rows_null = rows_in - len(df)
+
+        df = df.drop_duplicates(subset="id")
+
+        df["id"] = df["id"].astype("int64")
+        df["age"] = df["age"].astype("int8")  # rango real 12 a 70
+        df["latitude"] = df["latitude"].astype("float64")
+        df["longitude"] = df["longitude"].astype("float64")
+        df["created_at"] = pd.to_datetime(df["created_at"], format="ISO8601", utc=True).dt.as_unit("us")
+
+        # El email se normaliza ACÁ y no en mask_pii: el hash se calcula sobre el
+        # texto final, así que "Juan@Mail.com" y "juan@mail.com" tienen que llegar
+        # iguales o producirían dos hashes distintos para la misma persona.
+        df["email"] = df["email"].str.strip().str.lower()
+
+        df["gender"] = df["gender"].str.strip().str.upper()
+        for col in ["state", "city", "country", "traffic_source"]:
+            df[col] = df[col].str.strip().str.title()
+
+        # Nombres y dirección: solo se les quitan espacios. Son PII que mask_pii
+        # va a descartar, y aplicarles formato título alteraría apellidos legítimos.
+        for col in ["first_name", "last_name", "street_address"]:
+            df[col] = df[col].str.strip()
+
+        out = write_staging(df, "users")
+        print(f"[clean_users] {rows_in} filas leídas | {rows_null} con nulos en claves "
+              f"| {rows_in - rows_null - len(df)} duplicadas eliminadas | {len(df)} escritas en {out}")
+        print(f"[clean_users] emails repetidos entre usuarios: {int(df['email'].duplicated().sum())} "
+              f"| city nula: {int(df['city'].isna().sum())}")
+        return str(out)
 
     @task
-    def mask_pii() -> None:
-        """Hashea email con SHA-256 + salt; descarta first_name, last_name y street_address.
+    def mask_pii() -> str:
+        """Hashea email con SHA-256 + salt; descarta los identificadores directos.
 
         Pre:  Variable PII_SALT definida; se lee acá adentro, nunca a nivel módulo.
+              STAGING_DIR/users/ escrito por clean_users.
         Post: SILVER_DIR/users/ sin PII en claro; STAGING_DIR/users/ borrado.
         Inv:  mismo email + mismo salt → mismo hash (joinable, no reversible sin el salt).
         """
-        pass
+        # Variable.get() DENTRO de la task: a nivel módulo se ejecutaría en cada
+        # parseo del DAG (cada ~30 s) y golpearía la metadata DB al pedo.
+        try:
+            salt = Variable.get("PII_SALT")
+        except Exception as exc:
+            raise ValueError(
+                "Falta la Airflow Variable 'PII_SALT'. Cargala con "
+                "`airflow variables set PII_SALT <valor>` o desde Admin → Variables. "
+                "No se hashea sin salt: un SHA-256 pelado de emails se revierte por diccionario."
+            ) from exc
+
+        src = STAGING_DIR / "users" / "users.parquet"
+        df = pd.read_parquet(src)
+        rows_in = len(df)
+
+        # clean_users garantiza email no nulo, pero si algo cambiara aguas arriba
+        # un nulo acá sería grave: f"{salt}{None}" hashea el texto "None" y les
+        # daría a todos los nulos el mismo hash, como si fueran el mismo cliente.
+        if df["email"].isna().any():
+            raise ValueError(f"{int(df['email'].isna().sum())} emails nulos llegaron a mask_pii")
+
+        # El email ya viene en minúsculas y sin espacios desde clean_users: el hash
+        # se calcula sobre ese texto final para que sea estable entre corridas.
+        df["email_hash"] = [
+            hashlib.sha256(f"{salt}{email}".encode()).hexdigest() for email in df["email"]
+        ]
+
+        # Identificadores directos: se borran, no se hashean. Un hash solo sirve si
+        # necesitás unir por esa columna, y nadie agrupa ventas por nombre o calle.
+        # postal_code y lat/long también salen: 2.515 usuarios son los únicos con su
+        # código postal, así que ubican a una persona igual que la dirección.
+        direct_identifiers = [
+            "first_name", "last_name", "email", "street_address",
+            "postal_code", "latitude", "longitude",
+        ]
+        df = df.drop(columns=direct_identifiers)
+
+        # Red de seguridad: que no quede ninguna columna de PII por un cambio futuro
+        # en el esquema de origen.
+        leaked = sorted(set(direct_identifiers) & set(df.columns))
+        if leaked:
+            raise ValueError(f"PII sin enmascarar en silver: {leaked}")
+
+        out = write_silver(df, "users")
+
+        # El staging existe solo para este paso: una vez publicado silver, la copia
+        # con PII en claro no tiene por qué seguir en disco.
+        shutil.rmtree(STAGING_DIR / "users")
+
+        print(f"[mask_pii] {rows_in} filas | {df['email_hash'].nunique()} hashes distintos "
+              f"| columnas publicadas: {list(df.columns)}")
+        print(f"[mask_pii] staging borrado | nulos en silver: "
+              f"{ {c: int(n) for c, n in df.isna().sum().items() if n} }")
+        return str(out)
 
     @task_group(group_id="silver")
     def silver():
@@ -353,7 +573,6 @@ def medallion_pipeline_dag():
         clean_inventory_items()
         clean_products()
         clean_distribution_centers()
-        clean_events()
         clean_users() >> mask_pii()
 
     @task
