@@ -151,6 +151,38 @@ De las 15 columnas originales quedan 9:
 
 **Limitación a tener presente.** Como 15.989 usuarios comparten email, `email_hash` **no identifica unívocamente a un cliente**: agrupar por hash puede juntar dos usuarios distintos. La identidad de negocio sigue siendo `id`.
 
+## Compuerta de integridad (`validate_silver`)
+
+Antes de construir gold, se verifica que las tablas de silver se puedan unir sin perder ni multiplicar filas. La tarea distingue dos clases de problema:
+
+- **Unicidad de claves primarias → corta la corrida.** Una PK repetida multiplica filas en el join de gold y rompe el grano del modelo *en silencio*: la suma de ingresos daría más alta sin que nada falle. Es el tipo de error que no se puede dejar pasar.
+- **Integridad referencial → se loguea.** Un huérfano es un dato a investigar, pero qué hacer con él es una decisión de modelado que toma `build_gold` (unir con `INNER` o con `LEFT`), no la compuerta.
+
+Las cinco relaciones que se verifican son exactamente los joins que arma gold:
+
+```
+order_items.order_id          → orders.order_id
+order_items.user_id           → users.id
+order_items.product_id        → products.id
+order_items.inventory_item_id → inventory_items.id
+products.distribution_center_id → distribution_centers.id
+```
+
+**Resultado medido sobre los datos actuales:**
+
+| Tabla | Filas | PK |
+|---|---|---|
+| `orders` | 125.226 | `order_id` única |
+| `order_items` | 181.759 | `id` única |
+| `products` | 29.120 | `id` única |
+| `inventory_items` | 490.705 | `id` única |
+| `distribution_centers` | 10 | `id` única |
+| `users` | 100.000 | `id` única |
+
+**0 huérfanos en las cinco relaciones** (0,00% en cada una). Esto es lo que habilita usar `INNER JOIN` en gold sin perder ventas: está verificado, no asumido.
+
+**Costo.** La tarea lee únicamente las columnas de claves, no las tablas completas: validar la integridad de `inventory_items` no requiere cargar sus 490.705 registros con los doce campos.
+
 ### events: fuera del alcance
 
 `events.csv` (2.431.963 filas, 376 MB) registra la navegación de los usuarios por el sitio: clics, vistas de producto y carritos. No alimenta el modelo de gold, que se construye sobre ventas concretas. Se excluye del pipeline de silver, lo que además deja el dataset en 139 MB, dentro del límite de 50–300 MB de la consigna.

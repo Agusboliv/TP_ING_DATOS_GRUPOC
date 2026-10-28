@@ -575,7 +575,7 @@ def medallion_pipeline_dag():
         clean_distribution_centers()
         clean_users() >> mask_pii()
 
-    @task
+    @task(retries=0)  # si los datos están mal, reintentar no los arregla
     def validate_silver() -> None:
         """Compuerta antes de gold: unicidad de PKs e integridad referencial entre tablas.
 
@@ -583,7 +583,63 @@ def medallion_pipeline_dag():
         Post: loggea huérfanos de order_items → orders/products/users/inventory_items
               y de products → distribution_centers; falla si hay PKs duplicadas.
         """
-        pass
+        primary_keys = {
+            "orders": "order_id",
+            "order_items": "id",
+            "products": "id",
+            "inventory_items": "id",
+            "distribution_centers": "id",
+            "users": "id",
+        }
+
+        # (tabla hija, FK) → (tabla padre, PK). Son los joins que arma build_gold:
+        # un huérfano acá es una fila que el INNER JOIN de gold va a descartar.
+        foreign_keys = [
+            ("order_items", "order_id", "orders", "order_id"),
+            ("order_items", "user_id", "users", "id"),
+            ("order_items", "product_id", "products", "id"),
+            ("order_items", "inventory_item_id", "inventory_items", "id"),
+            ("products", "distribution_center_id", "distribution_centers", "id"),
+        ]
+
+        files = {table: SILVER_DIR / table / f"{table}.parquet" for table in primary_keys}
+        missing = sorted(table for table, path in files.items() if not path.is_file())
+        if missing:
+            raise ValueError(f"faltan tablas en silver: {missing}")
+
+        # Se leen solo las columnas de claves: validar integridad no necesita
+        # cargar los 490.705 registros completos de inventory_items.
+        needed = {table: {pk} for table, pk in primary_keys.items()}
+        for child, fk, parent, pk in foreign_keys:
+            needed[child].add(fk)
+            needed[parent].add(pk)
+        data = {t: pd.read_parquet(p, columns=sorted(needed[t])) for t, p in files.items()}
+
+        errors: list[str] = []
+
+        # 1) Unicidad de PK: esto SÍ corta la corrida. Una PK duplicada multiplica
+        # filas en el join de gold y rompe el grano del modelo en silencio.
+        for table, pk in primary_keys.items():
+            duplicated = int(data[table][pk].duplicated().sum())
+            if duplicated:
+                errors.append(f"{table}: {duplicated} valores repetidos en la PK '{pk}'")
+            print(f"[validate_silver] {table}: {len(data[table])} filas | PK '{pk}' "
+                  f"{'DUPLICADA' if duplicated else 'única'}")
+
+        # 2) Integridad referencial: se loguea, no se corta. Un huérfano es un dato
+        # a investigar, pero la decisión de qué hacer con él es de build_gold.
+        for child, fk, parent, pk in foreign_keys:
+            valid = set(data[parent][pk])
+            orphans = int((~data[child][fk].isin(valid)).sum())
+            total = len(data[child])
+            print(f"[validate_silver] {child}.{fk} → {parent}.{pk}: {orphans} huérfanos "
+                  f"de {total} ({orphans / total:.2%})")
+
+        if errors:
+            raise ValueError("Silver no pasó la validación:\n  - " + "\n  - ".join(errors))
+
+        print(f"[validate_silver] {len(primary_keys)} tablas con PK única y "
+              f"{len(foreign_keys)} relaciones verificadas")
 
     # ── Gold ──────────────────────────────────────────────────────────────────
 
