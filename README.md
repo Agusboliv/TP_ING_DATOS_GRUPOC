@@ -262,6 +262,69 @@ Eso es evidencia más fuerte que el conteo para el test de idempotencia: dos cor
 
 **Verificado** sobre dos particiones reales: `2023-10` (8.916 ítems) y `2023-05` (5.948 ítems), ambas con 0 duplicados, 0 filas fuera de ventana, 0 nulos y 0 columnas de PII.
 
+## Catálogo local DuckDB (`register_duckdb`)
+
+Expone gold a DuckDB creando una vista sobre las particiones:
+
+```sql
+CREATE OR REPLACE VIEW gold_order_items_enriched AS
+SELECT * FROM read_parquet(
+    '.../gold/order_items_enriched/**/*.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': 'VARCHAR', 'month': 'VARCHAR'}
+);
+```
+
+**La vista no copia datos: guarda la consulta.** El archivo `catalog.duckdb` pesa 274 KB mientras gold tiene 181.759 filas, porque lo único que almacena es ese texto SQL con un nombre. Cada `SELECT` sobre la vista lee los Parquet en ese momento, así que una partición nueva aparece sola sin volver a registrar nada.
+
+**`hive_types` fuerza `year` y `month` a VARCHAR.** Sin eso, DuckDB autocastea los valores de las carpetas a entero y `month = '05'` dejaría de coincidir, porque `05` se convertiría en `5`. Con el tipo fijado, los filtros del enunciado funcionan tal cual están escritos.
+
+**`CREATE OR REPLACE`** hace la tarea idempotente: corre en cada ejecución del DAG sin fallar por "la vista ya existe".
+
+**Resultado medido:**
+
+```
+[register_duckdb] vista 'gold_order_items_enriched' creada en /opt/airflow/data/catalog.duckdb
+[register_duckdb] 61 particiones (2019..2024) | 181759 filas | 125226 órdenes | ingresos 10,827,118.91
+```
+
+Y el filtro exacto devuelve lo esperado: `WHERE year='2023' AND month='05'` → 5.948 filas.
+
+**Nota sobre rutas.** La vista guarda la ruta absoluta del contenedor (`/opt/airflow/data/...`), así que el catálogo se consulta desde adentro de Airflow. Desde Windows se consulta apuntando directo a los Parquet con la ruta del host, que es lo que hacen `sql/gold_queries.sql` y `scripts/finops_validation.py`.
+
+**Comparación con AWS.** En Athena esta tarea no sería opcional: el catálogo de Glue es una lista explícita de particiones y habría que registrarlas con `MSCK REPAIR TABLE` o un Crawler. DuckDB resuelve el patrón `**/*.parquet` en el momento de la consulta, así que descubre las particiones nuevas solo.
+
+## Validación FinOps (`finops_report`)
+
+Corre **la misma agregación dos veces** —sin filtro de partición y con `WHERE year = '…' AND month = '…'`— y compara qué leyó el motor en cada caso. Lo único que cambia entre las dos consultas es el `WHERE`.
+
+**Resultado medido** sobre las 61 particiones:
+
+| | FULL SCAN | PRUNED |
+|---|---|---|
+| Archivos Parquet leídos | **61** | **1** |
+| Filas leídas | 181.759 | 5.948 |
+| Tiempo | 1.353,7 ms | 1.189,1 ms |
+
+El filtro evitó abrir **60 de 61 archivos (98,4% menos)**. Y DuckDB lo confirma en el nodo `TABLE_SCAN` de su propio plan:
+
+```
+   File Filters:
+   (year = '2023' AND month = '05')
+
+Scanning Files: 1/62
+```
+
+**Cómo se mide la cantidad de archivos.** Con `filename = true`, cada fila sabe de qué Parquet salió; contar los distintos prueba cuántos abrió el motor realmente. Es más directo que interpretar el plan.
+
+**La métrica que importa es la cantidad de archivos, no el tiempo.** A esta escala (181.759 filas, 13 MB) el tiempo está dominado por el arranque de la consulta y las dos cifras quedan parecidas. Lo que se está demostrando es el principio: el motor **descarta archivos sin abrirlos** gracias a la estructura de carpetas. En Athena, esos 60 archivos que no se abren son 60 archivos que no se facturan.
+
+**La tarea falla si el pruning no funciona.** Si la consulta filtrada leyera la misma cantidad de archivos que el scan completo, el particionado estaría mal y `finops_report` corta la corrida en vez de reportar un resultado inútil.
+
+El reporte completo con los dos `EXPLAIN ANALYZE` queda en `data/finops_report.txt`, y se reescribe en cada corrida.
+
+> **Pendiente:** hay una partición vacía `year=2024/month=02` de una corrida anterior. Por eso el plan dice `1/62` en vez de `1/61`. Hay que borrar esa carpeta.
+
 ### events: fuera del alcance
 
 `events.csv` (2.431.963 filas, 376 MB) registra la navegación de los usuarios por el sitio: clics, vistas de producto y carritos. No alimenta el modelo de gold, que se construye sobre ventas concretas. Se excluye del pipeline de silver, lo que además deja el dataset en 139 MB, dentro del límite de 50–300 MB de la consigna.

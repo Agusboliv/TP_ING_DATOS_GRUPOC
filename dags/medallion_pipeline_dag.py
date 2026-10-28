@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -873,20 +874,158 @@ def medallion_pipeline_dag():
               f"(idéntica en cada corrida del mismo mes → idempotencia)")
 
     @task
-    def register_duckdb() -> None:
+    def register_duckdb() -> str:
         """Expone gold en DuckDB con CREATE OR REPLACE VIEW sobre read_parquet(hive_partitioning=true).
 
+        Pre:  gold tiene al menos una partición escrita.
         Post: CATALOG_PATH con la vista actualizada.
+        Inv:  la vista NO copia datos: guarda la consulta. Por eso el catálogo pesa
+              unos KB y ve las particiones nuevas sin volver a registrarlas.
         """
-        pass
+        view = f"gold_{GOLD_DATASET}"
+        pattern = f"{GOLD_DIR / GOLD_DATASET}/**/*.parquet"
+
+        CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        connection = duckdb.connect(str(CATALOG_PATH))
+        try:
+            # hive_types fuerza year/month a VARCHAR para que los filtros del
+            # enunciado (year = '2023' AND month = '05') comparen exacto y no
+            # dependan del autocast de DuckDB, que convertiría '05' en 5.
+            connection.execute(
+                f"""
+                CREATE OR REPLACE VIEW {view} AS
+                SELECT * FROM read_parquet(
+                    '{pattern}',
+                    hive_partitioning = true,
+                    hive_types = {{'year': 'VARCHAR', 'month': 'VARCHAR'}}
+                )
+                """
+            )
+
+            partitions = connection.execute(
+                f"SELECT year, month, COUNT(*) FROM {view} GROUP BY year, month ORDER BY year, month"
+            ).fetchall()
+            rows, orders, revenue = connection.execute(
+                f"SELECT COUNT(*), COUNT(DISTINCT order_id), ROUND(SUM(sale_price), 2) FROM {view}"
+            ).fetchone()
+        finally:
+            connection.close()
+
+        years = sorted({year for year, _, _ in partitions})
+        print(f"[register_duckdb] vista '{view}' creada en {CATALOG_PATH}")
+        print(f"[register_duckdb] {len(partitions)} particiones ({years[0]}..{years[-1]}) "
+              f"| {rows} filas | {orders} órdenes | ingresos {revenue:,.2f}")
+        print(f"[register_duckdb] consultala con: "
+              f"SELECT * FROM {view} WHERE year = '2023' AND month = '05'")
+        return str(CATALOG_PATH)
 
     @task
-    def finops_report() -> None:
+    def finops_report(logical_date: datetime | None = None, dag_run=None) -> str:
         """Corre EXPLAIN ANALYZE full scan vs. pruned y guarda ambas salidas.
 
+        Pre:  gold tiene al menos una partición.
         Post: reporte en DATA_DIR con archivos y filas leídas por cada query.
+        Inv:  la consulta es la MISMA en los dos casos; lo único que cambia es el
+              WHERE sobre las columnas de partición.
         """
-        pass
+        run_date = pd.Timestamp(logical_date or dag_run.run_after)
+        run_date = run_date.tz_localize("UTC") if run_date.tzinfo is None else run_date.tz_convert("UTC")
+
+        pattern = f"{GOLD_DIR / GOLD_DATASET}/**/*.parquet"
+        source = (
+            f"read_parquet('{pattern}', hive_partitioning = true, "
+            "hive_types = {'year': 'VARCHAR', 'month': 'VARCHAR'})"
+        )
+        source_with_file = source.replace("hive_partitioning = true", "hive_partitioning = true, filename = true")
+
+        connection = duckdb.connect()
+        try:
+            available = connection.execute(
+                f"SELECT DISTINCT year, month FROM {source} ORDER BY year, month"
+            ).fetchall()
+            if not available:
+                print("[finops_report] gold está vacío, no hay nada que medir")
+                return ""
+
+            # Se filtra el mes de la corrida; si ese mes no tiene partición
+            # (fecha lógica fuera del dataset) se usa la última disponible, para
+            # que la comparación siempre sea contra una partición real.
+            target = (f"{run_date:%Y}", f"{run_date:%m}")
+            if target not in available:
+                target = available[-1]
+                print(f"[finops_report] {run_date:%Y-%m} no tiene partición, "
+                      f"se mide contra {target[0]}-{target[1]}")
+
+            query = """
+                SELECT year, month, COUNT(*) AS registros, ROUND(SUM(sale_price), 2) AS ingresos
+                FROM {source}
+                {where}
+                GROUP BY year, month
+                ORDER BY year, month
+            """
+            where = f"WHERE year = '{target[0]}' AND month = '{target[1]}'"
+
+            results = {}
+            for label, filter_clause in (("FULL SCAN", ""), ("PRUNED", where)):
+                sql = query.format(source=source, where=filter_clause)
+
+                start = time.perf_counter()
+                connection.execute(sql).fetchall()
+                elapsed_ms = (time.perf_counter() - start) * 1000
+
+                plan = connection.execute("EXPLAIN ANALYZE " + sql).fetchall()[0][1]
+                # Con filename=true cada fila sabe de qué Parquet salió: contar los
+                # distintos prueba cuántos archivos abrió realmente el motor.
+                files = connection.execute(
+                    f"SELECT COUNT(DISTINCT filename) FROM {source_with_file} {filter_clause}"
+                ).fetchone()[0]
+                rows = connection.execute(
+                    f"SELECT COUNT(*) FROM {source} {filter_clause}"
+                ).fetchone()[0]
+
+                results[label] = {"plan": plan, "files": files, "rows": rows, "ms": elapsed_ms}
+        finally:
+            connection.close()
+
+        full, pruned = results["FULL SCAN"], results["PRUNED"]
+        if pruned["files"] >= full["files"]:
+            raise ValueError(
+                f"el pruning no funciona: la consulta filtrada leyó {pruned['files']} "
+                f"archivos y el scan completo {full['files']}. Revisar year=/month= en gold."
+            )
+
+        reduction = 100 * (1 - pruned["files"] / full["files"])
+        report = DATA_DIR / "finops_report.txt"
+        report.write_text(
+            "\n".join([
+                f"Dataset : {GOLD_DIR / GOLD_DATASET}",
+                f"Filtro  : year = '{target[0]}' AND month = '{target[1]}'",
+                f"Generado: {datetime.now(tz=run_date.tz).isoformat()}",
+                "",
+                "=== FULL SCAN (sin filtro de partición) ===",
+                full["plan"],
+                "",
+                f"=== PRUNED SCAN (year='{target[0]}', month='{target[1]}') ===",
+                pruned["plan"],
+                "",
+                f"{'':<26}{'FULL SCAN':>12}{'PRUNED':>12}",
+                f"{'Archivos leídos':<26}{full['files']:>12}{pruned['files']:>12}",
+                f"{'Filas leídas':<26}{full['rows']:>12}{pruned['rows']:>12}",
+                f"{'Tiempo (ms)':<26}{full['ms']:>12.1f}{pruned['ms']:>12.1f}",
+                "",
+                f"El filtro de partición evitó abrir {full['files'] - pruned['files']} de "
+                f"{full['files']} archivos ({reduction:.1f}% menos).",
+            ]),
+            encoding="utf-8",
+        )
+
+        print(f"[finops_report] FULL SCAN: {full['files']} archivos, {full['rows']} filas, "
+              f"{full['ms']:.1f} ms")
+        print(f"[finops_report] PRUNED   : {pruned['files']} archivos, {pruned['rows']} filas, "
+              f"{pruned['ms']:.1f} ms")
+        print(f"[finops_report] el pruning evitó {full['files'] - pruned['files']} de "
+              f"{full['files']} archivos ({reduction:.1f}% menos) → {report}")
+        return str(report)
 
     # ── Dependencias ──────────────────────────────────────────────────────────
 
