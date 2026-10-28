@@ -81,6 +81,8 @@ def medallion_pipeline_dag():
 
         dest = dest_dir / src.name
         shutil.copy2(src, dest)
+        # no usamos pandas porque reescribe el archivo 
+        # y cambia el tamaño de bytes (aunque los datos sean iguales)
 
         src_bytes, dest_bytes = src.stat().st_size, dest.stat().st_size
         if dest_bytes != src_bytes:
@@ -89,14 +91,42 @@ def medallion_pipeline_dag():
         print(f"[extract] {table}: {src} → {dest} ({dest_bytes / 1e6:.1f} MB)")
         return str(dest)
 
-    @task
-    def validate_bronze() -> None:
+    @task(retries=0)  # si los datos están mal, reintentar no los arregla
+    def validate_bronze(paths: list[str]) -> None:
         """Compuerta antes de silver: las 7 tablas aterrizaron bien.
 
-        Pre:  corrieron todas las instancias de extract.
-        Post: falla el DAG si falta un archivo, está vacío o le faltan columnas esperadas.
+        Pre:  corrieron todas las instancias de extract; `paths` son sus rutas (vía XCom).
+        Post: falla el DAG si falta una tabla, si un archivo no existe, está vacío
+              o no tiene al menos encabezado + una fila de datos.
         """
-        pass
+        paths = [Path(p) for p in paths]
+        errors = []
+
+        # bronze/{table}/ingested_year=YYYY/ingested_month=MM/{archivo} → parents[2] es {table}
+        missing = set(SOURCE_FILES) - {p.parents[2].name for p in paths}
+        if missing:
+            errors.append(f"faltan tablas: {sorted(missing)}")
+
+        for path in paths:
+            if not path.is_file():
+                errors.append(f"no existe: {path}")
+                continue
+
+            # Solo las 2 primeras líneas: no hace falta leer los 394 MB de events
+            with path.open(encoding="utf-8") as f:
+                header, first_row = f.readline(), f.readline()
+
+            if not header.strip():
+                errors.append(f"vacío: {path}")
+            elif not first_row.strip():
+                errors.append(f"sin filas de datos: {path}")
+            else:
+                print(f"[validate_bronze] OK {path.parents[2].name}: "
+                      f"{path.stat().st_size / 1e6:.1f} MB | {header.strip()}")
+
+        # Se juntan todos los errores y se falla una sola vez, mostrando todo lo que está mal
+        if errors:
+            raise ValueError("Bronze inválido:\n  - " + "\n  - ".join(errors))
 
     # ── Silver ────────────────────────────────────────────────────────────────
 
@@ -225,9 +255,11 @@ def medallion_pipeline_dag():
 
     # ── Dependencias ──────────────────────────────────────────────────────────
 
+    # Pasar la salida de extract como argumento ya crea la dependencia extract >> validate_bronze
+    bronze_paths = extract.expand(table=list(SOURCE_FILES))
+
     (
-        extract.expand(table=list(SOURCE_FILES))
-        >> validate_bronze()
+        validate_bronze(bronze_paths)
         >> silver()
         >> validate_silver()
         >> build_gold()
