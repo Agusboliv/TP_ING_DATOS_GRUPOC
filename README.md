@@ -241,6 +241,27 @@ Un `product_name` quedó nulo: es uno de los dos productos sin nombre que `clean
 
 Cada ejecución escribe **un mes**. Para tener las 61 particiones del dataset (2019-01 a 2024-01) hay que hacer un **backfill** de ese rango. Si la fecha lógica cae fuera —por ejemplo una corrida manual de hoy— no hay órdenes que procesar y la partición queda vacía; la tarea lo avisa en el log en vez de fallar en silencio.
 
+### Compuerta de gold (`validate_gold`)
+
+Verifica la partición recién escrita, con cuatro controles que **cortan la corrida**:
+
+1. **Grano único.** Ningún `order_item_id` repetido. Un duplicado acá significa que algún join multiplicó filas y los ingresos salen inflados sin que nada más lo delate.
+2. **Ventana.** Si la carpeta dice `year=2023/month=10`, todas las filas tienen que tener `ordered_at` en octubre 2023.
+3. **Claves y métricas sin nulos** en `order_item_id`, `order_id`, `user_id`, `ordered_at` y `sale_price`. Gold es lo que consume el analista: un nulo acá rompe cualquier agregación.
+4. **Gobernanza.** Ninguna columna de PII en claro (`email`, nombres, dirección, código postal, coordenadas) puede haber llegado hasta gold. Es la última barrera, después de `mask_pii`.
+
+**Huella del contenido.** Además del conteo, la tarea calcula un SHA-256 de la partición ordenada por `order_item_id` y lo loguea:
+
+```
+[validate_gold] 2023-10 OK | 8916 ítems | 6108 órdenes | 30 columnas
+[validate_gold] ingresos 544,667.37 | margen 282,993.96 | devueltos 929
+[validate_gold] huella del contenido: 7034b82274018adb
+```
+
+Eso es evidencia más fuerte que el conteo para el test de idempotencia: dos corridas del mismo mes pueden dar la misma cantidad de filas con contenido distinto, pero no pueden dar la misma huella. Si los dos intentos loguean `7034b82274018adb`, las particiones son idénticas byte a byte en sus datos.
+
+**Verificado** sobre dos particiones reales: `2023-10` (8.916 ítems) y `2023-05` (5.948 ítems), ambas con 0 duplicados, 0 filas fuera de ventana, 0 nulos y 0 columnas de PII.
+
 ### events: fuera del alcance
 
 `events.csv` (2.431.963 filas, 376 MB) registra la navegación de los usuarios por el sitio: clics, vistas de producto y carritos. No alimenta el modelo de gold, que se construye sobre ventas concretas. Se excluye del pipeline de silver, lo que además deja el dataset en 139 MB, dentro del límite de 50–300 MB de la consigna.

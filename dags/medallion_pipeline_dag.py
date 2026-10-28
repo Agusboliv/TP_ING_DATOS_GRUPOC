@@ -74,12 +74,11 @@ def write_staging(df: pd.DataFrame, table: str) -> Path:
 @dag(
     dag_id="medallion_pipeline_dag",
     # @monthly porque la partición de gold es mensual: con @daily, las 30 corridas
-    # de un mes reescriben la misma carpeta. start_date/end_date acotan el DAG al
-    # rango real del dataset (2019-01 a 2024-01), así ninguna fecha lógica cae
-    # fuera de los datos y genera particiones vacías.
+    # de un mes reescriben la misma carpeta. start_date arranca con el dataset
+    # (2019-01); no se pone end_date para que un trigger manual con la fecha de hoy
+    # pueda correr el pipeline completo. Los meses sin ventas no escriben partición.
     schedule="@monthly",
     start_date=datetime(2019, 1, 1),
-    end_date=datetime(2024, 2, 1),
     catchup=False,
     tags=["TP_ING"],
     default_args={"retries": 2, "retry_delay": timedelta(seconds=15)},
@@ -669,10 +668,18 @@ def medallion_pipeline_dag():
             (orders["created_at"] >= window_start) & (orders["created_at"] < window_end)
         ]
 
+        out_dir = GOLD_DIR / GOLD_DATASET / f"year={window_start:%Y}" / f"month={window_start:%m}"
+
         if month_orders.empty:
-            print(f"[build_gold] ATENCIÓN: 0 órdenes en {window_start:%Y-%m}. "
-                  f"El dataset va de 2019-01 a 2024-01: si la fecha lógica cae fuera "
-                  f"de ese rango la partición queda vacía.")
+            # Mes sin ventas: no se publica una partición vacía. Si quedó una de
+            # una corrida anterior se borra, porque la partición tiene que reflejar
+            # lo que hay en silver. Pasa cuando la fecha lógica cae fuera del rango
+            # del dataset (2019-01 a 2024-01), por ejemplo en un trigger manual de hoy.
+            if out_dir.exists():
+                shutil.rmtree(out_dir)
+            print(f"[build_gold] {window_start:%Y-%m}: 0 órdenes en silver, no se escribe "
+                  f"partición. El dataset va de 2019-01 a 2024-01.")
+            return ""
 
         # El ítem pertenece al mes de SU ORDEN, no al de su propio created_at
         # (que puede caer días después). Por eso se filtra por order_id y no por fecha.
@@ -774,7 +781,6 @@ def medallion_pipeline_dag():
 
         # year y month NO van adentro del Parquet: viven en la ruta y DuckDB los
         # infiere con hive_partitioning. Escribirlos además sería duplicarlos.
-        out_dir = GOLD_DIR / GOLD_DATASET / f"year={window_start:%Y}" / f"month={window_start:%m}"
         out = _write_parquet_dir(gold, out_dir, GOLD_DATASET)
 
         print(f"[build_gold] {window_start:%Y-%m}: {len(month_orders)} órdenes → {len(gold)} ítems "
@@ -784,13 +790,87 @@ def medallion_pipeline_dag():
               f"| devueltos {int(gold['is_returned'].sum())}")
         return str(out)
 
-    @task
-    def validate_gold(logical_date: datetime | None = None) -> None:
+    @task(retries=0)  # si la partición está mal, reintentar no la arregla
+    def validate_gold(logical_date: datetime | None = None, dag_run=None) -> None:
         """Chequea grano único (order_items.id) y loggea conteo de la partición.
 
+        Pre:  build_gold escribió la partición de esta corrida.
         Post: conteo loggeado → evidencia del test de idempotencia (dos corridas, mismo número).
         """
-        pass
+        run_date = pd.Timestamp(logical_date or dag_run.run_after)
+        run_date = run_date.tz_localize("UTC") if run_date.tzinfo is None else run_date.tz_convert("UTC")
+        window_start = run_date.normalize().replace(day=1)
+        window_end = window_start + pd.offsets.MonthBegin(1)
+
+        partition = (
+            GOLD_DIR / GOLD_DATASET / f"year={window_start:%Y}" / f"month={window_start:%m}"
+            / f"{GOLD_DATASET}.parquet"
+        )
+        if not partition.is_file():
+            # Puede ser legítimo (mes sin ventas) o un fallo de build_gold. Se
+            # distingue mirando silver: si hay órdenes de ese mes, falta la partición.
+            orders = pd.read_parquet(SILVER_DIR / "orders" / "orders.parquet", columns=["created_at"])
+            in_window = int((
+                (orders["created_at"] >= window_start) & (orders["created_at"] < window_end)
+            ).sum())
+            if in_window:
+                raise ValueError(
+                    f"falta la partición {window_start:%Y-%m} y silver tiene "
+                    f"{in_window} órdenes de ese mes"
+                )
+            print(f"[validate_gold] {window_start:%Y-%m}: 0 ventas en silver y sin partición. "
+                  f"Correcto, nada que validar.")
+            return
+
+        df = pd.read_parquet(partition)
+        errors: list[str] = []
+
+        # 1) Grano: un registro por ítem vendido. Un order_item_id repetido
+        # significa que algún join multiplicó filas y los ingresos salen inflados.
+        duplicated = int(df["order_item_id"].duplicated().sum())
+        if duplicated:
+            errors.append(f"{duplicated} order_item_id repetidos: el join multiplicó filas")
+
+        # 2) Ventana: la partición dice un mes, su contenido tiene que ser ese mes.
+        outside = int((
+            (df["ordered_at"] < window_start) | (df["ordered_at"] >= window_end)
+        ).sum())
+        if outside:
+            errors.append(f"{outside} filas fuera de {window_start:%Y-%m}")
+
+        # 3) Claves y métricas sin nulos: gold es la capa que consume el analista.
+        for column in ["order_item_id", "order_id", "user_id", "ordered_at", "sale_price"]:
+            nulls = int(df[column].isna().sum())
+            if nulls:
+                errors.append(f"{nulls} nulos en '{column}'")
+
+        # 4) Gobernanza: ninguna columna de PII en claro puede haber llegado hasta acá.
+        forbidden = {"email", "first_name", "last_name", "street_address",
+                     "postal_code", "latitude", "longitude"}
+        leaked = sorted(forbidden & set(df.columns))
+        if leaked:
+            errors.append(f"PII en claro en gold: {leaked}")
+
+        if errors:
+            raise ValueError(f"Gold {window_start:%Y-%m} no pasó la validación:\n  - "
+                             + "\n  - ".join(errors))
+
+        # Huella del contenido: dos corridas del mismo mes tienen que dar la misma.
+        # Es más fuerte que comparar el conteo, porque detecta que las filas
+        # cambiaron aunque sigan siendo la misma cantidad.
+        fingerprint = hashlib.sha256(
+            pd.util.hash_pandas_object(
+                df.sort_values("order_item_id"), index=False
+            ).values.tobytes()
+        ).hexdigest()[:16]
+
+        print(f"[validate_gold] {window_start:%Y-%m} OK | {len(df)} ítems "
+              f"| {df['order_id'].nunique()} órdenes | {len(df.columns)} columnas")
+        print(f"[validate_gold] ingresos {df['sale_price'].sum():,.2f} "
+              f"| margen {df['margin'].sum():,.2f} "
+              f"| devueltos {int(df['is_returned'].sum())}")
+        print(f"[validate_gold] huella del contenido: {fingerprint} "
+              f"(idéntica en cada corrida del mismo mes → idempotencia)")
 
     @task
     def register_duckdb() -> None:
