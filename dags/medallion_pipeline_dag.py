@@ -38,6 +38,30 @@ SOURCE_FILES = {
 GOLD_ASSET = Asset(f"file://{GOLD_DIR / GOLD_DATASET}")
 
 
+# ── Helpers compartidos por las tareas ─────────────────────────────────────────
+
+def bronze_dir(table: str, ingestion_date: datetime) -> Path:
+    """Carpeta de bronze de `table` para una fecha de ingesta (particionado estilo Hive)."""
+    return (
+        BRONZE_DIR
+        / table
+        / f"ingested_year={ingestion_date:%Y}"
+        / f"ingested_month={ingestion_date:%m}"
+    )
+
+
+def write_silver(df: pd.DataFrame, table: str) -> Path:
+    """Sobrescribe SILVER_DIR/{table}/ con un único Parquet (overwrite, nunca append)."""
+    out_dir = SILVER_DIR / table
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
+
+    out = out_dir / f"{table}.parquet"
+    df.to_parquet(out, index=False)
+    return out
+
+
 @dag(
     dag_id="medallion_pipeline_dag",
     schedule="@daily",
@@ -69,12 +93,7 @@ def medallion_pipeline_dag():
         if not src.is_file():
             raise FileNotFoundError(f"No existe el archivo fuente de '{table}': {src}")
 
-        dest_dir = (
-            BRONZE_DIR
-            / table
-            / f"ingested_year={ingestion_date:%Y}"
-            / f"ingested_month={ingestion_date:%m}"
-        )
+        dest_dir = bronze_dir(table, ingestion_date)
         if dest_dir.exists():
             shutil.rmtree(dest_dir)
         dest_dir.mkdir(parents=True)
@@ -131,13 +150,62 @@ def medallion_pipeline_dag():
     # ── Silver ────────────────────────────────────────────────────────────────
 
     @task
-    def clean_orders() -> None:
-        """Tipado de created/shipped/delivered/returned_at; normaliza casing de status; dedup por order_id.
+    def clean_orders(logical_date: datetime | None = None, dag_run=None) -> str:
+        """Tipa, normaliza y deduplica orders de bronze y lo escribe en silver.
 
-        Post: SILVER_DIR/orders/ en Parquet; order_id único.
-        Inv:  nulls en shipped/delivered/returned_at se aceptan solo si son coherentes con status.
+        Pre:  bronze/orders de la fecha de ingesta de esta corrida existe (validate_bronze pasó).
+        Post: SILVER_DIR/orders/orders.parquet con tipos explícitos; order_id único.
+        Inv:  los nulos de shipped/delivered/returned_at se conservan como NaT: no son datos
+              faltantes, son eventos que todavía no ocurrieron según el status.
         """
-        pass
+        src = bronze_dir("orders", logical_date or dag_run.run_after) / SOURCE_FILES["orders"]
+
+        # Todo como texto: los tipos los decidimos nosotros, no la inferencia de pandas
+        df = pd.read_csv(src, dtype=str)
+        rows_in = len(df)
+
+        # Dedup por clave primaria (antes de tipar, sobre el valor crudo)
+        df = df.drop_duplicates(subset="order_id")
+
+        # Tipado de ids y cantidades
+        df["order_id"] = df["order_id"].astype("int64")
+        df["user_id"] = df["user_id"].astype("int64")
+        df["num_of_item"] = df["num_of_item"].astype("int8")  # valores 1 a 4
+
+        # Normalización de categóricas (en el CSV ya vienen limpias; esto blinda re-cargas)
+        df["status"] = df["status"].str.strip().str.title()
+        df["gender"] = df["gender"].str.strip().str.upper()
+
+        # Fechas: ISO8601 acepta las dos variantes del CSV (con y sin microsegundos).
+        # Las celdas vacías quedan como NaT, que en Parquet se guarda como NULL de tipo timestamp.
+        # as_unit("us"): el CSV no tiene más precisión que microsegundos, y así DuckDB lo lee
+        # como TIMESTAMPTZ estándar en vez de TIMESTAMPTZ_NS.
+        date_cols = ["created_at", "shipped_at", "delivered_at", "returned_at"]
+        for col in date_cols:
+            df[col] = pd.to_datetime(df[col], format="ISO8601", utc=True).dt.as_unit("us")
+
+        # Coherencia status ↔ fechas: qué fechas tiene que tener cada status (el resto, nulas)
+        expected_dates = {
+            "Processing": set(),
+            "Cancelled": set(),
+            "Shipped": {"shipped_at"},
+            "Complete": {"shipped_at", "delivered_at"},
+            "Returned": {"shipped_at", "delivered_at", "returned_at"},
+        }
+        unknown = set(df["status"]) - set(expected_dates)
+        if unknown:
+            raise ValueError(f"status desconocidos en orders: {sorted(unknown)}")
+
+        incoherent = pd.Series(False, index=df.index)
+        for col in ["shipped_at", "delivered_at", "returned_at"]:
+            should_have = df["status"].map(lambda s: col in expected_dates[s])
+            incoherent |= df[col].notna() != should_have
+
+        out = write_silver(df, "orders")
+        print(f"[clean_orders] {rows_in} filas leídas | {rows_in - len(df)} duplicadas eliminadas "
+              f"| {incoherent.sum()} incoherentes status/fechas | {len(df)} escritas en {out}")
+        print(f"[clean_orders] nulos: {df[date_cols].isna().sum().to_dict()}")
+        return str(out)
 
     @task
     def clean_order_items() -> None:
