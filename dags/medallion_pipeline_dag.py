@@ -164,6 +164,18 @@ def medallion_pipeline_dag():
         df = pd.read_csv(src, dtype=str)
         rows_in = len(df)
 
+        # Nulos que invalidan la fila entera. Se descartan ANTES de deduplicar para
+        # que un order_id nulo no compita como clave:
+        #   order_id   sin PK la orden no se puede unir a sus ítems
+        #   user_id    sin cliente no se puede unir a users ni atribuir la venta
+        #   created_at es la fecha de negocio que particiona gold: sin ella no hay partición
+        #   status     gobierna la regla status ↔ fechas de más abajo
+        # gender y num_of_item NO entran: una orden sin género declarado o sin
+        # cantidad sigue siendo una venta válida y contable.
+        required = ["order_id", "user_id", "created_at", "status"]
+        df = df.dropna(subset=required)
+        rows_null = rows_in - len(df)
+
         # Dedup por clave primaria (antes de tipar, sobre el valor crudo)
         df = df.drop_duplicates(subset="order_id")
 
@@ -202,18 +214,87 @@ def medallion_pipeline_dag():
             incoherent |= df[col].notna() != should_have
 
         out = write_silver(df, "orders")
-        print(f"[clean_orders] {rows_in} filas leídas | {rows_in - len(df)} duplicadas eliminadas "
+        print(f"[clean_orders] {rows_in} filas leídas | {rows_null} con nulos en claves "
+              f"| {rows_in - rows_null - len(df)} duplicadas eliminadas "
               f"| {incoherent.sum()} incoherentes status/fechas | {len(df)} escritas en {out}")
         print(f"[clean_orders] nulos: {df[date_cols].isna().sum().to_dict()}")
         return str(out)
 
     @task
-    def clean_order_items() -> None:
-        """Tipado de sale_price y timestamps; dedup por id.
+    def clean_order_items(logical_date: datetime | None = None, dag_run=None) -> str:
+        """Tipa, normaliza y deduplica order_items de bronze y lo escribe en silver.
 
-        Post: SILVER_DIR/order_items/ en Parquet; id único.
+        Pre:  bronze/order_items de la fecha de ingesta de esta corrida existe (validate_bronze pasó).
+        Post: SILVER_DIR/order_items/order_items.parquet con tipos explícitos; id único.
+        Inv:  los nulos de shipped/delivered/returned_at se conservan como NaT: el ítem avanza
+              junto con su orden, así que la fecha ausente es un evento que no ocurrió.
         """
-        pass
+        src = bronze_dir("order_items", logical_date or dag_run.run_after) / SOURCE_FILES["order_items"]
+
+        # Todo como texto: los tipos los decidimos nosotros, no la inferencia de pandas
+        df = pd.read_csv(src, dtype=str)
+        rows_in = len(df)
+
+        # Nulos que invalidan la fila entera, descartados antes de deduplicar.
+        # Acá entran las cinco claves: sin ellas el ítem no se puede atribuir a
+        # ninguna orden, cliente, producto ni unidad de inventario, y el grano de
+        # gold deja de tener sentido. created_at y status gobiernan la partición y
+        # la regla de coherencia. sale_price no entra en esta lista: se valida
+        # aparte y hace fallar la tarea, porque un importe perdido altera las sumas.
+        required = ["id", "order_id", "user_id", "product_id", "inventory_item_id",
+                    "created_at", "status"]
+        df = df.dropna(subset=required)
+        rows_null = rows_in - len(df)
+
+        # Dedup por clave primaria (antes de tipar, sobre el valor crudo)
+        df = df.drop_duplicates(subset="id")
+
+        # Tipado de la PK y de las 4 claves foráneas. int64 igual que en clean_orders:
+        # en gold se unen order_id ↔ orders.order_id y user_id ↔ users.id, y un join
+        # entre tipos distintos es una fuente silenciosa de filas perdidas.
+        for col in ["id", "order_id", "user_id", "product_id", "inventory_item_id"]:
+            df[col] = df[col].astype("int64")
+
+        # sale_price es el único valor monetario de la tabla y el que gold agrega
+        # (ingresos y margen), así que va a float64 y se valida el rango.
+        df["sale_price"] = df["sale_price"].astype("float64")
+        invalid_price = df["sale_price"].isna() | (df["sale_price"] < 0)
+        if invalid_price.any():
+            raise ValueError(f"{invalid_price.sum()} filas con sale_price nulo o negativo")
+
+        # Normalización de categóricas (en el CSV ya vienen limpias; esto blinda re-cargas)
+        df["status"] = df["status"].str.strip().str.title()
+
+        # Mismo criterio de fechas que orders: ISO8601 para las dos variantes del CSV
+        # y microsegundos para que DuckDB lo lea como TIMESTAMPTZ estándar.
+        date_cols = ["created_at", "shipped_at", "delivered_at", "returned_at"]
+        for col in date_cols:
+            df[col] = pd.to_datetime(df[col], format="ISO8601", utc=True).dt.as_unit("us")
+
+        # El ítem hereda el ciclo de vida de su orden, así que vale la misma regla
+        # status ↔ fechas que en clean_orders.
+        expected_dates = {
+            "Processing": set(),
+            "Cancelled": set(),
+            "Shipped": {"shipped_at"},
+            "Complete": {"shipped_at", "delivered_at"},
+            "Returned": {"shipped_at", "delivered_at", "returned_at"},
+        }
+        unknown = set(df["status"]) - set(expected_dates)
+        if unknown:
+            raise ValueError(f"status desconocidos en order_items: {sorted(unknown)}")
+
+        incoherent = pd.Series(False, index=df.index)
+        for col in ["shipped_at", "delivered_at", "returned_at"]:
+            should_have = df["status"].map(lambda s: col in expected_dates[s])
+            incoherent |= df[col].notna() != should_have
+
+        out = write_silver(df, "order_items")
+        print(f"[clean_order_items] {rows_in} filas leídas | {rows_null} con nulos en claves "
+              f"| {rows_in - rows_null - len(df)} duplicadas eliminadas "
+              f"| {incoherent.sum()} incoherentes status/fechas | {len(df)} escritas en {out}")
+        print(f"[clean_order_items] nulos: {df[date_cols].isna().sum().to_dict()}")
+        return str(out)
 
     @task
     def clean_inventory_items() -> None:
