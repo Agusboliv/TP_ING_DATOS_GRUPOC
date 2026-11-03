@@ -6,6 +6,23 @@ Pipeline bronze → silver → gold orquestado con Airflow y consultado con Duck
 
 kaggle : https://www.kaggle.com/datasets/mustafakeser4/looker-ecommerce-bigquery-dataset?select=products.csv
 
+## Cómo correrlo
+
+Todas las rutas son relativas al repo: después de clonarlo no hay que mover ningún archivo. Hace falta Docker con Compose (Docker Desktop en Windows o Mac).
+
+1. **Datos.** Descargá el dataset de Kaggle y copiá los CSV, con sus nombres originales, en `data/source/`. La carpeta `data/` dentro de tu carpeta docker. Tiene que estar también `events.csv`, porque `extract` copia todos los archivos de `SOURCE_FILES`.
+2. **Solo en Linux.** Creá el `.env` para que los archivos que escribe Airflow queden a tu nombre: `echo "AIRFLOW_UID=$(id -u)" > .env`.
+3. **Levantar Airflow** desde la raíz del repo: `docker compose up -d --build`. La primera vez construye la imagen con `requirements.txt` e inicializa la base. La UI queda en http://localhost:8080 (usuario y contraseña `airflow`).
+4. **Cargar el salt** de la PII: `docker compose exec airflow-scheduler airflow variables set PII_SALT <valor-secreto>`, o desde Admin → Variables. Sin el salt, `mask_pii` falla.
+5. **Correr meses con datos.** Activá `medallion_pipeline_dag` en la UI. El dataset va de 2019-01 a 2024-01, así que una corrida con la fecha de hoy no escribe gold. Para cargar, por ejemplo, 2023 completo:
+
+    ```bash
+    docker compose exec airflow-scheduler airflow backfill create --dag-id medallion_pipeline_dag --from-date 2023-01-01 --to-date 2023-12-01 --max-active-runs 1
+    ```
+
+    `finops_report` se saltea hasta que gold tenga al menos dos meses, porque con una sola partición no hay nada que podar.
+6. **Validar desde la PC.** Con `pip install duckdb`, `python scripts/finops_validation.py` lee `data/gold/` y guarda el reporte en `docs/`. Con `pip install duckdb-cli`, `duckdb -f sql/gold_queries.sql` corre las consultas del catálogo.
+
 ## Manejo de nulos y calidad de datos (silver)
 
 Cada decisión sobre nulos queda documentada con su justificación de negocio. Las tablas se van agregando a medida que se implementa su tarea `clean_*`.

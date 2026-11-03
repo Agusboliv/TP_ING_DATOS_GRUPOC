@@ -4,13 +4,13 @@
 -- En el pipeline la vista se crea con la ruta del contenedor escrita literal
 -- ('/opt/airflow/data/gold/order_items_enriched/**/*.parquet') y se guarda en
 -- data/catalog.duckdb. Acá la ruta sale de una variable para poder correr el
--- archivo desde Windows contra los mismos Parquet.
+-- archivo desde la PC contra los mismos Parquet.
 --
 -- Cómo correrlo (desde la raíz del repo, con `pip install duckdb-cli`):
 --     duckdb -f sql/gold_queries.sql
--- Antes, cambiá la ruta de la línea SET VARIABLE por la de tu carpeta del docker-compose.
+-- La ruta es relativa a la raíz del repo, donde el docker-compose deja data/.
 
-SET VARIABLE gold_dir = 'C:/Users/User/airflow-docker/data/gold/order_items_enriched';
+SET VARIABLE gold_dir = 'data/gold/order_items_enriched';
 
 -- 1) Vista sobre todas las particiones. No copia datos: guarda la consulta, así que
 --    una partición nueva aparece sola sin volver a registrarla. hive_partitioning

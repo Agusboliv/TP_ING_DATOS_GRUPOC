@@ -5,10 +5,11 @@ usando EXPLAIN ANALYZE, y compara archivos, filas y datos leídos. Si la consult
 filtrada no abre menos archivos, termina con error. El reporte se imprime y se
 guarda en docs/finops_report.txt.
 
-Cómo correrlo en local (desde la raíz del repo, con `pip install duckdb`):
-    python scripts/finops_validation.py --gold-dir "C:/Users/<usuario>/airflow-docker/data/gold/order_items_enriched"
-    python scripts/finops_validation.py --gold-dir "..." --year 2023 --month 5
-Sin --year/--month mide la última partición. `--help` lista el resto de opciones.
+Cómo correrlo en local (con `pip install duckdb`):
+    python scripts/finops_validation.py
+    python scripts/finops_validation.py --year 2023 --month 5
+Por defecto lee data/gold/ del propio repo, que es donde el docker-compose deja
+los datos. Sin --year/--month mide la última partición. `--help` lista el resto.
 
 En el pipeline: la tarea finops_report de dags/medallion_pipeline_dag.py hace la
 misma medición en cada corrida, después de validate_gold, y guarda su reporte en
@@ -27,13 +28,16 @@ from pathlib import Path
 import duckdb
 
 GOLD_DATASET = "order_items_enriched"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+# Dentro del contenedor AIRFLOW_HOME vale /opt/airflow. En la PC no está definida,
+# y los datos están en data/ del repo, porque el docker-compose monta ./data.
 DEFAULT_GOLD_DIR = (
-    Path(os.environ.get("AIRFLOW_HOME", Path.home() / "airflow")) / "data" / "gold" / GOLD_DATASET
+    Path(os.environ.get("AIRFLOW_HOME", REPO_ROOT)) / "data" / "gold" / GOLD_DATASET
 )
 # El reporte va a docs/ del repo (scripts/ y docs/ son hermanas), y no a data/,
 # que está en .gitignore: así la evidencia de FinOps queda versionada con la entrega.
 # Se arma desde la ubicación del script, así funciona desde cualquier carpeta.
-DEFAULT_REPORT = Path(__file__).resolve().parent.parent / "docs" / "finops_report.txt"
+DEFAULT_REPORT = REPO_ROOT / "docs" / "finops_report.txt"
 
 # La consulta es idéntica en los dos escenarios: lo único que cambia es el WHERE.
 QUERY = """
@@ -66,21 +70,25 @@ def run_validation(gold_dir: Path, year: str | None = None, month: str | None = 
           EXPLAIN ANALYZE, los archivos abiertos, las filas leídas y el tiempo.
     Inv:  la consulta es la misma en los dos casos; solo cambia el WHERE.
     """
-    # Carpeta inexistente y carpeta vacía son problemas distintos: el primero casi
-    # siempre es una ruta mal apuntada (por ejemplo, AIRFLOW_HOME sin definir fuera
-    # de Docker), el segundo es que todavía no corrió ningún mes con datos.
+    # Carpeta inexistente y carpeta vacía son problemas distintos: el primero es
+    # una ruta mal apuntada, el segundo es que todavía no corrió ningún mes con datos.
     if not gold_dir.is_dir():
         raise FileNotFoundError(
-            f"no existe la carpeta {gold_dir}. Pasá la ruta con --gold-dir, por ejemplo "
-            f'--gold-dir "<carpeta del docker-compose>/data/gold/{GOLD_DATASET}", '
-            "o definí AIRFLOW_HOME apuntando a la carpeta del docker-compose"
+            f"no existe la carpeta {gold_dir}. Si los datos están en otro lado, "
+            "pasá la ruta con --gold-dir"
         )
 
     partitions = available_partitions(gold_dir)
     if not partitions:
         raise FileNotFoundError(
             f"gold está vacío: {gold_dir} existe pero no tiene Parquet en "
-            f"{Path('year=*') / 'month=*'}. Corré build_gold para algún mes entre 2019-01 y 2024-01"
+            f"{Path('year=*') / 'month=*'}. Corré el DAG para algún mes entre 2019-01 y 2024-01"
+        )
+    # Con una sola partición el filtro lee lo mismo que el scan completo: no hay
+    # nada que podar y la comparación no prueba nada.
+    if len(partitions) < 2:
+        raise ValueError(
+            "gold tiene una sola partición: el pruning se mide con al menos dos meses cargados"
         )
 
     if year is None and month is None:

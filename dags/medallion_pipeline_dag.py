@@ -12,6 +12,7 @@ import duckdb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from airflow.exceptions import AirflowSkipException
 from airflow.sdk import Asset, Variable, dag, task, task_group
 
 # ── Rutas y constantes 
@@ -70,6 +71,16 @@ def write_silver(df: pd.DataFrame, table: str) -> Path:
 def write_staging(df: pd.DataFrame, table: str) -> Path:
     """Igual que write_silver pero en STAGING_DIR: datos con PII que no pueden llegar a silver."""
     return _write_parquet_dir(df, STAGING_DIR / table, table)
+
+
+def gold_partitions() -> list[tuple[str, str]]:
+    """Particiones (year, month) de gold que tienen al menos un Parquet, ordenadas.
+
+    Se leen del disco y no con DuckDB: read_parquet sobre una carpeta sin
+    archivos tira IOException en vez de devolver 0 filas.
+    """
+    files = (GOLD_DIR / GOLD_DATASET).glob("year=*/month=*/*.parquet")
+    return sorted({(f.parent.parent.name.split("=", 1)[1], f.parent.name.split("=", 1)[1]) for f in files})
 
 
 @dag(
@@ -877,13 +888,20 @@ def medallion_pipeline_dag():
     def register_duckdb() -> str:
         """Expone gold en DuckDB con CREATE OR REPLACE VIEW sobre read_parquet(hive_partitioning=true).
 
-        Pre:  gold tiene al menos una partición escrita.
+        Pre:  gold tiene al menos una partición escrita; si no, la tarea se saltea.
         Post: CATALOG_PATH con la vista actualizada.
         Inv:  la vista NO copia datos: guarda la consulta. Por eso el catálogo pesa
               unos KB y ve las particiones nuevas sin volver a registrarlas.
         """
         view = f"gold_{GOLD_DATASET}"
         pattern = f"{GOLD_DIR / GOLD_DATASET}/**/*.parquet"
+
+        # Gold vacío es normal en un clon recién hecho o en una corrida de un mes
+        # sin ventas: no hay nada que registrar, así que la tarea se saltea.
+        if not gold_partitions():
+            raise AirflowSkipException(
+                "gold no tiene particiones todavía: corré algún mes entre 2019-01 y 2024-01"
+            )
 
         CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         connection = duckdb.connect(str(CATALOG_PATH))
@@ -923,7 +941,7 @@ def medallion_pipeline_dag():
     def finops_report(logical_date: datetime | None = None, dag_run=None) -> str:
         """Corre EXPLAIN ANALYZE full scan vs. pruned y guarda ambas salidas.
 
-        Pre:  gold tiene al menos una partición.
+        Pre:  gold tiene al menos dos particiones; si no, la tarea se saltea.
         Post: reporte en DATA_DIR con archivos y filas leídas por cada query.
         Inv:  la consulta es la MISMA en los dos casos; lo único que cambia es el
               WHERE sobre las columnas de partición.
@@ -938,14 +956,18 @@ def medallion_pipeline_dag():
         )
         source_with_file = source.replace("hive_partitioning = true", "hive_partitioning = true, filename = true")
 
+        # Con menos de dos particiones no hay nada que podar: el filtro lee los mismos
+        # archivos que el scan completo y la comparación fallaría sin que el
+        # particionado esté mal. Pasa en la primera corrida de un clon recién hecho.
+        available = gold_partitions()
+        if len(available) < 2:
+            raise AirflowSkipException(
+                f"gold tiene {len(available)} partición(es): el pruning se mide con al menos "
+                "dos meses cargados"
+            )
+
         connection = duckdb.connect()
         try:
-            available = connection.execute(
-                f"SELECT DISTINCT year, month FROM {source} ORDER BY year, month"
-            ).fetchall()
-            if not available:
-                print("[finops_report] gold está vacío, no hay nada que medir")
-                return ""
 
             # Se filtra el mes de la corrida; si ese mes no tiene partición
             # (fecha lógica fuera del dataset) se usa la última disponible, para

@@ -8,10 +8,10 @@
 --
 -- Cómo correrlo (desde la raíz del repo, con `pip install duckdb-cli`):
 --     duckdb -f sql/finops_queries.sql
--- Antes, cambiá la ruta de la línea SET VARIABLE por la de tu carpeta del docker-compose,
--- y si querés medir otro mes, cambiá '2023' y '05' en las consultas filtradas.
+-- La ruta es relativa a la raíz del repo, donde el docker-compose deja data/.
+-- Para medir otro mes, cambiá '2023' y '05' en las consultas filtradas.
 
-SET VARIABLE gold_dir = 'C:/Users/User/airflow-docker/data/gold/order_items_enriched';
+SET VARIABLE gold_dir = 'data/gold/order_items_enriched';
 
 -- Fuente común a todas las consultas: las particiones de gold como columnas de texto.
 CREATE OR REPLACE TEMP VIEW gold AS
