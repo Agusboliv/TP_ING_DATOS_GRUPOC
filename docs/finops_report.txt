@@ -1,0 +1,81 @@
+Dataset    : C:\Users\User\airflow-docker\data\gold\order_items_enriched
+Particiones: 12
+Filtro     : year = '2024' AND month = '01'
+Generado   : 2026-11-02T20:17:51-03:00
+
+=== FULL SCAN (sin filtro de partición) ===
+╭─ Summary ───────────╮
+│ Total Time: 0.0080s │
+│ Data Read: 450.8 kB │
+╰─────────────────────╯
+╭─ Order By ────────────────────────────────────────────────────────────────────╮
+│ Order By: year ASC, month ASC                                                 │
+│ 12 rows                                                                   0µs │
+╰───────────────────────────────────────┬───────────────────────────────────────╯
+╭─ Projection ──────────────────────────┴───────────────────────────────────────╮
+│ Projections: year, month, registros, ingresos                                 │
+│ 12 rows                                                                   0µs │
+╰───────────────────────────────────────┬───────────────────────────────────────╯
+╭─ Partitioned Aggregate ───────────────┴───────────────────────────────────────╮
+│ Groups: #0, #1                                                                │
+│ Aggregates: count_star(), sum(#2)                                             │
+│ 12 rows                                                                   0µs │
+╰───────────────────────────────────────┒┎──────────────────────────────────────╯
+╭─ Projection ──────────────────────────┚┖──────────────────────────────────────╮
+│ Projections: year, month, sale_price                                          │
+│ 93,939 rows                                                               0µs │
+╰───────────────────────────────────────┒┎──────────────────────────────────────╯
+╭─ Table Scan ──────────────────────────┚┖──────────────────────────────────────╮
+│ Function: READ_PARQUET                                                        │
+│ Projections: year, month, sale_price                                          │
+│ Total Files Read: 12                                                          │
+│ Filename(s):                                                                  │
+│ C:/Users/User/airflow-docker/data/gold/order_items_enriched/**/*.parquet, ... │
+│ Row Groups Scanned: 12 / 12                                                   │
+│ 93,939 rows                                                            40.0ms │
+╰───────────────────────────────────────────────────────────────────────────────╯
+
+
+=== PRUNED SCAN (year = '2024' AND month = '01') ===
+╭─ Summary ───────────╮
+│ Total Time: 0.0086s │
+│ Data Read:  65.2 kB │
+╰─────────────────────╯
+╭─ Order By ──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Order By: year ASC, month ASC                                                                               │
+│ 1 row                                                                                                   0µs │
+╰──────────────────────────────────────────────────────┬──────────────────────────────────────────────────────╯
+╭─ Projection ─────────────────────────────────────────┴──────────────────────────────────────────────────────╮
+│ Projections: year, month, registros, ingresos                                                               │
+│ 1 row                                                                                                   0µs │
+╰──────────────────────────────────────────────────────┬──────────────────────────────────────────────────────╯
+╭─ Partitioned Aggregate ──────────────────────────────┴──────────────────────────────────────────────────────╮
+│ Groups: #0, #1                                                                                              │
+│ Aggregates: count_star(), sum(#2)                                                                           │
+│ 1 row                                                                                                   0µs │
+╰──────────────────────────────────────────────────────┒┎─────────────────────────────────────────────────────╯
+╭─ Projection ─────────────────────────────────────────┚┖─────────────────────────────────────────────────────╮
+│ Projections: year, month, sale_price                                                                        │
+│ 13,222 rows                                                                                             0µs │
+╰──────────────────────────────────────────────────────┒┎─────────────────────────────────────────────────────╯
+╭─ Table Scan ─────────────────────────────────────────┚┖─────────────────────────────────────────────────────╮
+│ Function: READ_PARQUET                                                                                      │
+│ Projections: year, month, sale_price                                                                        │
+│ File Filters:                                                                                               │
+│ (year = '2024')(month = '01')                                                                               │
+│ Scanning Files: 1/12                                                                                        │
+│ Total Files Read: 1                                                                                         │
+│ Filename(s):                                                                                                │
+│ C:/Users/User/airflow-docker/data/gold/order_items_enriched/year=2024/month=01/order_items_enriched.parquet │
+│ Row Groups Scanned: 1 / 1                                                                                   │
+│ 13,222 rows                                                                                          10.0ms │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+                     FULL SCAN      PRUNED
+Archivos leídos             12           1
+Filas leídas             93939       13222
+Datos leídos          450.8 kB     65.2 kB
+Tiempo (ms)               15.8         9.2
+
+El filtro de partición evitó abrir 11 de 12 archivos (91.7% menos).

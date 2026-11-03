@@ -1,0 +1,30 @@
+# Datos que genera el pipeline (bronze, silver, gold, source): el repo guarda
+# solo el código que los genera. Incluye cualquier CSV con PII.
+data/
+
+# Lo que crea Airflow si se levanta el docker-compose desde esta carpeta.
+logs/
+config/airflow.cfg
+*.duckdb
+
+# Consigna del TP.
+docs/TP DE 2026 - Local.pdf
+
+# Variables de entorno locales del docker-compose (AIRFLOW_UID). El compose usa
+# 50000 si no existe, y es donde irían secretos si alguna vez hicieran falta.
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Sistema operativo
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# EDAs exploratorios de cada fuente: sirven para entender los datos,
+# no son parte del pipeline.
+scripts/*_eda.py
